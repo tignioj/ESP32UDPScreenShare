@@ -326,12 +326,27 @@ void drawFrame() {
 // ================= Setup =================
 void setup() {
     Serial.begin(115200);
+    tft_init();
+    
+    tft->initDMA();
+    tft->setSwapBytes(true);
 
+    tft->setTextFont(1);      // 明确指定字体
+    tft->setCursor(0, 4);    // ❗ 不要带第三个参数
+    // 清屏并设置文字
+    tft->fillScreen(TFT_BLACK);
+    tft->setTextSize(2);
+    tft->setTextColor(TFT_WHITE);
+    
+    // 显示文字
+    tft->println("Waiting for WiFi...");
+    
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
         delay(300);
         Serial.print(".");
     }
+    tft->fillScreen(TFT_GREEN);
     Serial.println("\nWiFi connected");
 
     udp.begin(UDP_PORT);
@@ -340,9 +355,6 @@ void setup() {
         frameBuf[i].state = BUF_FREE;
     }
     init_scale_maps();
-    tft_init();
-    tft->initDMA();
-    tft->setSwapBytes(true);
 
     // 分配 DMA 缓冲区
     dmaBuf[0] = (uint16_t*)heap_caps_malloc(
@@ -371,6 +383,12 @@ void setup() {
     );
     
     tft->fillScreen(TFT_BLACK);
+    String wifi_str = WiFi.localIP().toString() + ":8888";
+    tft->println(wifi_str);
+    tft->setCursor(0,54);    // ❗ 不要带第三个参数
+    tft->setTextFont(2);      // 明确指定字体
+    tft->setTextSize(1);
+    tft->println("Streaming client: https://github.com/tignioj/ESP32UDPScreenShareClient");
 }
 
 // ================= Debug Info =================
