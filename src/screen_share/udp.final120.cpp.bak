@@ -1,0 +1,365 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "common.h"
+
+// WiFi配置
+const char* ssid = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiUDP udp;
+#define UDP_PORT 8888
+#define RGB_LINE_BATCH 6   // 每次接收行数
+
+// 图像参数
+#define SRC_W 120    // 源宽度
+#define SRC_H 120    // 源高度
+#define DST_W 240    // 目标宽度
+#define DST_H 240    // 目标高度
+
+// 多缓冲配置
+#define FRAME_BUF_COUNT 15  // 缓冲区数量，可根据内存调整
+
+// 缓冲区状态枚举
+enum BufState {
+    BUF_FREE,       // 空闲可用
+    BUF_FILLING,    // 正在填充数据
+    BUF_READY,      // 数据就绪，等待显示
+    BUF_DISPLAYING  // 正在显示
+};
+
+// 多缓冲结构
+struct FrameData {
+    uint16_t y_start;                    // 原始行索引
+    uint16_t line_count;                 // 原始行数
+    uint16_t lines[RGB_LINE_BATCH * SRC_W]; // 原始数据（120像素/行）
+    volatile BufState state;             // 缓冲区状态
+};
+
+FrameData frameBuf[FRAME_BUF_COUNT];     // 多缓冲区数组
+
+// DMA缓冲区
+uint16_t* dmaBuf[2];
+volatile uint8_t dmaSel = 0;
+
+// 统计信息
+volatile uint32_t frameCount = 0;
+volatile uint32_t dropCount = 0;
+volatile uint32_t udpPackets = 0;
+
+// ------------------------- 全局运行数据 -------------------------
+struct ScreenShareAppRunData
+{
+    unsigned long last_debug_time;
+    uint32_t debug_interval;
+};
+static ScreenShareAppRunData *run_data = NULL;
+
+// ------------------------- 初始化数据 -------------------------
+int initdata() {
+    run_data = (ScreenShareAppRunData*)malloc(sizeof(ScreenShareAppRunData));
+    if (!run_data) return -1;
+    memset(run_data, 0, sizeof(ScreenShareAppRunData));
+    
+    run_data->last_debug_time = millis();
+    run_data->debug_interval = 1000;  // 1秒打印一次调试信息
+    
+    // 初始化多缓冲区状态
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        frameBuf[i].state = BUF_FREE;
+    }
+    
+    // 分配DMA缓冲区
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(
+        DST_W * RGB_LINE_BATCH * 2 * sizeof(uint16_t),
+        MALLOC_CAP_DMA
+    );
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(
+        DST_W * RGB_LINE_BATCH * 2 * sizeof(uint16_t),
+        MALLOC_CAP_DMA
+    );
+    
+    if (!dmaBuf[0] || !dmaBuf[1]) {
+        free(run_data);
+        return -1;
+    }
+    
+    return 0;
+}
+
+// ------------------------- UDP 接收任务 -------------------------
+void udpReceiverTask(void *parameter) {
+    Serial.println("UDP接收任务启动");
+    
+    while (1) {
+        int packetSize = udp.parsePacket();
+        if (packetSize <= 0) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+            continue;
+        }
+        
+        udpPackets++;
+        
+        // 读取包头
+        uint8_t header[6];
+        if (udp.read(header, 6) != 6) {
+            udp.flush();
+            continue;
+        }
+        
+        uint16_t y_start    = (header[2] << 8) | header[3];
+        uint16_t line_count = (header[4] << 8) | header[5];
+        
+        if (line_count == 0 || line_count > RGB_LINE_BATCH) {
+            udp.flush();
+            continue;
+        }
+        
+        uint32_t expected_size = SRC_W * line_count * 2;
+        
+        // 寻找空闲缓冲区
+        FrameData* targetBuf = nullptr;
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            if (frameBuf[i].state == BUF_FREE) {
+                targetBuf = &frameBuf[i];
+                targetBuf->state = BUF_FILLING;
+                break;
+            }
+        }
+        
+        // 如果没有空闲缓冲区，丢弃数据包
+        if (!targetBuf) {
+            dropCount++;
+            udp.flush();
+            continue;
+        }
+        
+        // 读取图像数据
+        if (udp.read((uint8_t*)targetBuf->lines, expected_size) != expected_size) {
+            targetBuf->state = BUF_FREE;  // 读取失败，释放缓冲区
+            continue;
+        }
+        
+        // 字节交换（如果需要）
+        // for (int i = 0; i < SRC_W * line_count; i++) {
+        //     uint16_t c = targetBuf->lines[i];
+        //     targetBuf->lines[i] = (c << 8) | (c >> 8);
+        // }
+        
+        // 设置缓冲区信息
+        targetBuf->y_start = y_start;
+        targetBuf->line_count = line_count;
+        targetBuf->state = BUF_READY;
+        
+        // 简单的流量控制：如果缓冲区使用超过75%，延迟一下
+        // int usedBuffers = 0;
+        // for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        //     if (frameBuf[i].state != BUF_FREE) usedBuffers++;
+        // }
+        
+        // if (usedBuffers > FRAME_BUF_COUNT * 3 / 4) {
+        //     vTaskDelay(1 / portTICK_PERIOD_MS);
+        // }
+    }
+}
+
+// 插值缩放函数：将120像素行扩展到240像素（带平滑插值）
+inline void scaleLine120to240_nn(uint16_t* src, uint16_t* dst) {
+    for (int i = 0; i < SRC_W; i++) {
+        uint16_t c = src[i];
+        dst[i * 2]     = c;
+        dst[i * 2 + 1] = c;
+    }
+}
+
+// ------------------------- 显示任务 -------------------------
+void draw_frame_task_optimized() {
+    // 查找最旧的就绪缓冲区
+    FrameData* displayBuf = nullptr;
+    int oldestIdx = -1;
+    
+    for (int i = FRAME_BUF_COUNT-1; i >=0 ; i--) {
+        if (frameBuf[i].state == BUF_READY) {
+            displayBuf = &frameBuf[i];
+            oldestIdx = i;
+            break;
+        }
+    }
+    
+    if (!displayBuf) {
+        return;  // 没有就绪的缓冲区
+    }
+    
+    displayBuf->state = BUF_DISPLAYING;
+    
+    // 等待DMA完成（如果正在使用）
+    tft->dmaWait();
+    
+    uint8_t nextDma = dmaSel ^ 1;
+    uint16_t* dmaBuffer = dmaBuf[nextDma];
+    int dstIndex = 0;
+    // 处理每一行数据
+    for (int l = 0; l < displayBuf->line_count; l++) {
+        uint16_t* srcLine = &displayBuf->lines[l * SRC_W];
+        
+        // 垂直放大 ×2
+        scaleLine120to240_nn(srcLine, &dmaBuffer[dstIndex]);
+        dstIndex += DST_W;
+        scaleLine120to240_nn(srcLine, &dmaBuffer[dstIndex]);
+        dstIndex += DST_W;
+    }
+
+    // 计算显示位置
+    int displayY = displayBuf->y_start * 2;  // 垂直放大2倍
+    int displayH = displayBuf->line_count * 2;
+    
+    // 发送到屏幕
+    tft->startWrite();
+    tft->pushImageDMA(
+        0,                    // x
+        displayY,             // y
+        DST_W,                // width
+        displayH,             // height
+        dmaBuffer             // data
+    );
+    tft->endWrite();
+    
+    // 更新DMA选择器
+    dmaSel = nextDma;
+    
+    // 释放缓冲区
+    displayBuf->state = BUF_FREE;
+    frameCount++;
+}
+
+// ------------------------- 调试信息打印 -------------------------
+void printDebugInfo() {
+    static uint32_t lastPrint = 0;
+    uint32_t now = millis();
+    
+    if (now - lastPrint > 1000) {
+        lastPrint = now;
+        
+        Serial.printf("内存: %u, ", ESP.getFreeHeap());
+        Serial.printf("UDP包/秒: %u, ", udpPackets);
+        Serial.printf("丢包数: %u, ", dropCount);
+        Serial.printf("显示帧数: %u, ", frameCount);
+        
+        // 显示缓冲区状态
+        Serial.print("缓冲区状态: ");
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            switch(frameBuf[i].state) {
+                case BUF_FREE: Serial.print("F"); break;
+                case BUF_FILLING: Serial.print("I"); break;
+                case BUF_READY: Serial.print("R"); break;
+                case BUF_DISPLAYING: Serial.print("D"); break;
+            }
+        }
+        Serial.println();
+        
+        udpPackets = 0;
+    }
+}
+// void printDebugInfo() {
+//     unsigned long now = millis();
+//     if (now - run_data->last_debug_time >= run_data->debug_interval) {
+//         run_data->last_debug_time = now;
+        
+//         // 计算缓冲区使用情况
+//         int freeCount = 0, fillingCount = 0, readyCount = 0, displayingCount = 0;
+//         for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+//             switch (frameBuf[i].state) {
+//                 case BUF_FREE: freeCount++; break;
+//                 case BUF_FILLING: fillingCount++; break;
+//                 case BUF_READY: readyCount++; break;
+//                 case BUF_DISPLAYING: displayingCount++; break;
+//             }
+//         }
+        
+//         Serial.printf("\n=== 屏幕共享调试信息 ===\n");
+//         Serial.printf("内存: %d 字节\n", ESP.getFreeHeap());
+//         Serial.printf("缓冲区: %d个 (空闲:%d 填充:%d 就绪:%d 显示:%d)\n", 
+//                       FRAME_BUF_COUNT, freeCount, fillingCount, readyCount, displayingCount);
+//         Serial.printf("UDP包/秒: %d\n", udpPackets);
+//         Serial.printf("丢包数: %d\n", dropCount);
+//         Serial.printf("显示帧数: %d\n", frameCount);
+        
+//         // 重置计数
+//         udpPackets = 0;
+//     }
+// }
+
+// ------------------------- Arduino setup -------------------------
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n=== 屏幕共享启动 ===");
+
+    // 连接WiFi
+    WiFi.begin(ssid, password);
+    Serial.printf("正在连接WiFi: %s", ssid);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi连接成功!");
+        Serial.printf("IP地址: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("\nWiFi连接失败!");
+        return;
+    }
+
+    // 初始化数据
+    if (initdata() != 0) {
+        Serial.println("初始化失败!");
+        return;
+    }
+
+    // 启动UDP
+    udp.begin(UDP_PORT);
+    Serial.printf("UDP监听端口: %d\n", UDP_PORT);
+
+    // 初始化屏幕
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(false);
+    
+    // 显示测试画面
+    tft->fillScreen(TFT_RED);
+    delay(200);
+    tft->fillScreen(TFT_GREEN);
+    delay(200);
+    tft->fillScreen(TFT_BLUE);
+    delay(200);
+    tft->fillScreen(TFT_BLACK);
+    
+    tft->setSwapBytes(true);  // 设置为true，让库处理字节交换
+
+    // 创建UDP接收任务
+    xTaskCreatePinnedToCore(
+        udpReceiverTask,
+        "UDP Receiver",
+        10240,
+        NULL,
+        1,
+        NULL,
+        0
+    );
+    
+    Serial.println("系统初始化完成!");
+}
+
+// ------------------------- Arduino loop -------------------------
+void loop() {
+    // 处理屏幕任务
+    // screen.routine();
+
+    // 绘制最新帧
+    draw_frame_task_optimized();
+
+    // 打印调试信息
+    printDebugInfo();
+}

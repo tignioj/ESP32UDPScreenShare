@@ -1,0 +1,251 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiUDP udp;
+#define UDP_PORT 8888
+
+// ================= Image =================
+#define IMG_W 240
+#define IMG_H 240
+#define LINES_PER_UDP_PACKET 3
+#define LINES_PER_DMA_BATCH 9
+
+// ================= Frame Buffer =================
+#define FRAME_BUF_COUNT 24
+
+enum BufState {
+    BUF_FREE,
+    BUF_FILLING,
+    BUF_READY,
+    BUF_DISPLAYING
+};
+
+struct FrameBlock {
+    uint16_t start_line;
+    uint16_t line_count;
+    volatile BufState state;
+};
+
+FrameBlock frameBlocks[FRAME_BUF_COUNT];
+uint16_t* frameData[FRAME_BUF_COUNT];
+
+// ================= DMA =================
+uint16_t* dmaBuf[2];
+volatile uint8_t activeDmaBuf = 0;
+
+// ================= Stats =================
+volatile uint32_t frameCount = 0;
+volatile uint32_t dropCount = 0;
+volatile uint32_t udpPackets = 0;
+
+// =================================================
+// UDP Receiver Task
+// =================================================
+void udpReceiverTask(void* param) {
+    const int packetSize = IMG_W * LINES_PER_UDP_PACKET * 2 + 6;
+    uint8_t* packet = (uint8_t*)malloc(packetSize);
+
+    while (1) {
+        int len = udp.parsePacket();
+        if (len <= 0) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        udp.read(packet, packetSize);
+        udpPackets++;
+
+        uint16_t y_start   = (packet[2] << 8) | packet[3];
+        uint16_t line_cnt  = (packet[4] << 8) | packet[5];
+
+        if (line_cnt != LINES_PER_UDP_PACKET) continue;
+        if (y_start >= IMG_H) continue;
+
+        uint16_t block_start = (y_start / LINES_PER_DMA_BATCH) * LINES_PER_DMA_BATCH;
+
+        // ====== ① 先找正在填充的 block ======
+        int buf_idx = -1;
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            if (frameBlocks[i].state == BUF_FILLING &&
+                frameBlocks[i].start_line == block_start) {
+                buf_idx = i;
+                break;
+            }
+        }
+
+        // ====== ② 没有就新建 ======
+        if (buf_idx == -1) {
+            for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+                if (frameBlocks[i].state == BUF_FREE) {
+                    buf_idx = i;
+                    frameBlocks[i].state = BUF_FILLING;
+                    frameBlocks[i].start_line = block_start;
+                    frameBlocks[i].line_count = 0;
+                    break;
+                }
+            }
+        }
+
+        if (buf_idx == -1) {
+            dropCount++;
+            continue;
+        }
+
+        // ====== 拷贝数据 ======
+        uint32_t offset = (y_start - block_start) * IMG_W;
+        if (offset + IMG_W * line_cnt > IMG_W * LINES_PER_DMA_BATCH) {
+            frameBlocks[buf_idx].state = BUF_FREE;
+            continue;
+        }
+
+        memcpy(&frameData[buf_idx][offset],
+               &packet[6],
+               IMG_W * line_cnt * 2);
+
+        frameBlocks[buf_idx].line_count += line_cnt;
+
+        // ====== 满 9 行才 READY ======
+        if (frameBlocks[buf_idx].line_count >= LINES_PER_DMA_BATCH) {
+            frameBlocks[buf_idx].state = BUF_READY;
+        }
+    }
+}
+
+// =================================================
+// DMA Processing
+// =================================================
+void processAccumulatedDMA() {
+    int ready_idx = -1;
+
+    // 取最新 READY
+    for (int i = FRAME_BUF_COUNT - 1; i >= 0; i--) {
+        if (frameBlocks[i].state == BUF_READY) {
+            ready_idx = i;
+            break;
+        }
+    }
+
+    if (ready_idx == -1) return;
+
+    // 其余 READY 丢弃（防堆积）
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        if (i != ready_idx && frameBlocks[i].state == BUF_READY) {
+            frameBlocks[i].state = BUF_FREE;
+            dropCount++;
+        }
+    }
+
+    tft->dmaWait();
+
+    uint8_t nextBuf = activeDmaBuf ^ 1;
+    memcpy(dmaBuf[nextBuf],
+           frameData[ready_idx],
+           IMG_W * LINES_PER_DMA_BATCH * 2);
+
+    tft->startWrite();
+    tft->pushImageDMA(
+        0,
+        frameBlocks[ready_idx].start_line,
+        IMG_W,
+        LINES_PER_DMA_BATCH,
+        dmaBuf[nextBuf]
+    );
+    tft->endWrite();
+
+    activeDmaBuf = nextBuf;
+
+    frameBlocks[ready_idx].state = BUF_FREE;
+    frameBlocks[ready_idx].line_count = 0;
+
+    frameCount++;
+}
+
+// =================================================
+// Setup / Loop
+// =================================================
+void setup() {
+    Serial.begin(115200);
+    WiFi.begin(ssid, password);
+    screen.init(4, 100);
+    tft->fillScreen(TFT_RED);
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.print(".");
+        delay(500);
+    } 
+    tft->fillScreen(TFT_GREEN);
+
+    udp.begin(UDP_PORT);
+
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        frameBlocks[i].state = BUF_FREE;
+        frameData[i] = (uint16_t*)heap_caps_malloc(
+            IMG_W * LINES_PER_DMA_BATCH * 2,
+            MALLOC_CAP_DMA
+        );
+        memset(frameData[i], 0, IMG_W * LINES_PER_DMA_BATCH * 2);
+    }
+
+
+    tft->initDMA();
+    tft->setSwapBytes(true);
+
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(
+        IMG_W * LINES_PER_DMA_BATCH * 2,
+        MALLOC_CAP_DMA
+    );
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(
+        IMG_W * LINES_PER_DMA_BATCH * 2,
+        MALLOC_CAP_DMA
+    );
+
+    xTaskCreatePinnedToCore(
+        udpReceiverTask,
+        "udp_rx",
+        8192,
+        nullptr,
+        2,
+        nullptr,
+        0
+    );
+}
+// ================= 调试输出 =================
+void printDebugInfo() {
+    static uint32_t lastPrint = 0;
+    uint32_t now = millis();
+    
+    if (now - lastPrint > 1000) {
+        lastPrint = now;
+        
+        Serial.printf("== 系统状态 ==\n");
+        Serial.printf("内存: %u\n", ESP.getFreeHeap());
+        Serial.printf("UDP包/秒: %u\n", udpPackets);
+        Serial.printf("丢包数: %u\n", dropCount);
+        Serial.printf("显示帧数: %u\n", frameCount);
+        
+        // 显示缓冲区状态
+        Serial.print("缓冲区状态: ");
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            switch(frameBlocks[i].state) {
+                case BUF_FREE: Serial.print("F"); break;
+                case BUF_FILLING: Serial.print("I"); break;
+                case BUF_READY: Serial.print("R"); break;
+                case BUF_DISPLAYING: Serial.print("D"); break;
+            }
+        }
+        Serial.println();
+        
+        udpPackets = 0;
+    }
+}
+
+void loop() {
+    printDebugInfo();
+    processAccumulatedDMA();
+    delay(1);
+}

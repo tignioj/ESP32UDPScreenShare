@@ -1,0 +1,33 @@
+
+#include "common.h"
+#include "screen_share_gui.h"
+#include "WiFi.h"
+
+void setup() {
+    Serial.begin(115200);
+    Serial.flush();
+        // 需要放在Setup里初始化
+    if (!SPIFFS.begin(true))
+    {
+        Serial.println("SPIFFS Mount Failed");
+        return;
+    }
+        /*** Init screen ***/
+    screen.init(4,100);
+    tft->fillScreen(TFT_RED);
+    delay(1000);
+    tft->fillScreen(TFT_GREEN);
+    delay(1000);
+    tft->fillScreen(TFT_BLUE);
+    screen_share_gui_init();
+            display_screen_share(
+            "Screen Share",
+            WiFi.localIP().toString().c_str(),
+            "8081",
+            "Wait connect ....",
+            LV_SCR_LOAD_ANIM_NONE);
+}
+
+void loop() {
+    screen.routine();
+}

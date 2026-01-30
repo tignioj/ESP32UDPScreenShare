@@ -1,0 +1,129 @@
+#include <WiFi.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+#define TCP_PORT 8888
+
+WiFiServer server(TCP_PORT);
+WiFiClient client;
+
+// ================= Screen & DMA =================
+#define IMG_W 120
+#define MAX_LINES_PER_PACKET 60   // 一次最多接收的行数
+#define BUFFER_SIZE (IMG_W * MAX_LINES_PER_PACKET * 2)
+
+uint16_t *dmaBuf[2];     // 双缓冲
+bool dmaBufSel = false;  // 当前使用的缓冲区
+
+unsigned long last_packet_time = 0;
+
+// ------------------------- 工具函数 -------------------------
+bool readBytesWithTimeout(WiFiClient &client, uint8_t *buffer, size_t size, uint32_t timeout_ms) {
+    unsigned long startTime = millis();
+    size_t bytesRead = 0;
+    
+    while (bytesRead < size) {
+        if (millis() - startTime > timeout_ms) return false;
+        if (client.available() > 0) {
+            bytesRead += client.read(buffer + bytesRead, size - bytesRead);
+            last_packet_time = millis();
+        }
+        vTaskDelay(1 / portTICK_PERIOD_MS); // 避免忙等待
+    }
+    return true;
+}
+
+// ================= SETUP =================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("\n===== ESP32 MJPEG STREAM (NO PSRAM) =====");
+    Serial.printf("psramFound(): %s\n", psramFound() ? "YES" : "NO");
+
+    // ---- WiFi ----
+    WiFi.setSleep(false);
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+    server.begin();
+    server.setNoDelay(true);
+    Serial.printf("TCP server started @ %d\n", TCP_PORT);
+
+    // ---- Screen ----
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(true);
+    tft->fillScreen(TFT_BLACK);
+
+    // ---- 双缓冲分配 ----
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA);
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA);
+
+    if (!dmaBuf[0] || !dmaBuf[1]) {
+        Serial.println("Failed to allocate DMA buffers!");
+        while(1);
+    }
+}
+
+// ================= LOOP =================
+void loop() {
+    // 等客户端连接
+    if (!client || !client.connected()) {
+        client = server.available();
+        if (client) Serial.println("[TCP] Client connected");
+        delay(5);
+        return;
+    }
+
+    // 没数据就不读
+    if (!client.available()) {
+        delay(1);
+        return;
+    }
+
+    // ---- 读取 6 字节包头 ----
+    uint8_t header[6];
+    if (client.read(header, 6) != 6) return;
+
+    uint16_t frame_id   = (header[0] << 8) | header[1];
+    uint16_t y_start    = (header[2] << 8) | header[3];
+    uint16_t line_count = (header[4] << 8) | header[5];
+
+    if (line_count == 0 || line_count > MAX_LINES_PER_PACKET) {
+        client.stop();
+        return;
+    }
+
+    Serial.printf("fid=%d, y=%d, count=%d\n", frame_id, y_start, line_count);
+
+    // ---- 指定 DMA 缓冲区接收数据 ----
+    uint16_t* currentBuf = dmaBuf[dmaBufSel];
+    uint32_t expected_size = IMG_W * line_count * 2;
+
+    if (!readBytesWithTimeout(client, (uint8_t*)currentBuf, expected_size, 200)) {
+        Serial.println("Data read timeout, disconnecting client");
+        client.stop();
+        return;
+    }
+
+    // ---- 等待上一次 DMA 完成 ----
+    tft->dmaWait();
+
+    // ---- DMA 输出 ----
+    tft->startWrite();
+    tft->pushImageDMA(0, y_start, IMG_W, line_count, currentBuf, currentBuf);
+    tft->endWrite();
+
+    // ---- 切换缓冲区 ----
+    dmaBufSel = !dmaBufSel;
+}

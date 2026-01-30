@@ -1,0 +1,250 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiUDP udp;
+#define UDP_PORT 8888
+
+// ================= Image =================
+#define SRC_W 180
+#define SRC_H 180
+
+#define DST_W 240
+#define DST_H 240
+
+#define RGB_LINE_BATCH 4
+
+// 180 -> 240，最大放大比例 4/3
+#define MAX_DST_LINES ((RGB_LINE_BATCH * 4 + 2) / 3)
+
+// ================= Frame Buffer =================
+#define FRAME_BUF_COUNT 16
+
+enum BufState {
+    BUF_FREE,
+    BUF_FILLING,
+    BUF_READY,
+    BUF_DISPLAYING
+};
+
+struct FrameData {
+    uint16_t y_start;    // 源图 y（0~179）
+    uint16_t line_count; // <= RGB_LINE_BATCH
+    uint16_t lines[RGB_LINE_BATCH * SRC_W];
+    volatile BufState state;
+};
+
+FrameData frameBuf[FRAME_BUF_COUNT];
+
+// ================= DMA =================
+uint16_t* dmaBuf[2];
+volatile uint8_t dmaSel = 0;
+
+// ================= Stats =================
+volatile uint32_t frameCount = 0;
+volatile uint32_t dropCount  = 0;
+volatile uint32_t udpPackets = 0;
+// ================= Utils =================
+static inline int mapDstYtoSrcY(int dstY) {
+    // dstY * 3 / 4
+    return (dstY * 3) >> 2;
+}
+
+// ================= UDP Receiver Task =================
+void udpReceiverTask(void* param) {
+    while (1) {
+        int packetSize = udp.parsePacket();
+        if (packetSize <= 0) {
+            vTaskDelay(1);
+            continue;
+        }
+        udpPackets++;
+        uint8_t header[6];
+        if (udp.read(header, 6) != 6) {
+            udp.flush();
+            continue;
+        }
+
+        uint16_t y_start    = (header[2] << 8) | header[3];
+        uint16_t line_count = (header[4] << 8) | header[5];
+
+        if (line_count == 0 || line_count > RGB_LINE_BATCH) {
+            udp.flush();
+            continue;
+        }
+
+        uint32_t expect = SRC_W * line_count * 2;
+
+        FrameData* f = nullptr;
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            if (frameBuf[i].state == BUF_FREE) {
+                f = &frameBuf[i];
+                f->state = BUF_FILLING;
+                if(i>8) Serial.printf("%d正在装填中",i);
+                break;
+            }
+        }
+
+        if (!f) {
+            dropCount++;
+            udp.flush();
+             Serial.println("UDP接收缓冲不够了");
+            continue;
+        }
+
+        if (udp.read((uint8_t*)f->lines, expect) != expect) {
+            f->state = BUF_FREE;
+            continue;
+        }
+
+        f->y_start    = y_start;
+        f->line_count = line_count;
+        f->state      = BUF_READY;
+    }
+}
+
+// TODO 目前存在隐患，前期好好的，后面会一直满缓存。
+// TODO 1. 把放大操作放入UDP接收任务中
+// TODO 2. 异步操作DMA，去掉dmaWait
+// TODO 3. 去掉堆积的Ready
+// ================= Draw Frame =================
+void drawFrame() {
+    FrameData* f = nullptr;
+
+    for (int i = FRAME_BUF_COUNT - 1; i >= 0; i--) {
+        if (frameBuf[i].state == BUF_READY) {
+            f = &frameBuf[i];
+            break;
+        }
+    }
+
+    if (!f) return;
+    f->state = BUF_DISPLAYING;
+
+    uint8_t nextDma = dmaSel ^ 1;
+    tft->dmaWait();
+
+    int srcY0 = f->y_start;
+    int srcY1 = srcY0 + f->line_count;
+
+    int dstY0 = (srcY0 * 4) / 3;
+    int dstY1 = (srcY1 * 4 + 2) / 3;
+
+    int dstLines = dstY1 - dstY0;
+    if (dstLines > MAX_DST_LINES) {
+        dstLines = MAX_DST_LINES; // 保险
+    }
+
+    for (int dy = 0; dy < dstLines; dy++) {
+        int dstY = dstY0 + dy;
+        int srcY = mapDstYtoSrcY(dstY) - srcY0;
+
+        if (srcY < 0) srcY = 0;
+        if (srcY >= f->line_count) srcY = f->line_count - 1;
+
+        const uint16_t* srcLine = f->lines + srcY * SRC_W;
+        uint16_t* dstLine = dmaBuf[nextDma] + dy * DST_W;
+
+        for (int x = 0; x < DST_W; x++) {
+            int sx = (x * 3) >> 2;
+            dstLine[x] = srcLine[sx];
+        }
+    }
+
+    tft->startWrite();
+    tft->pushImageDMA(
+        0,
+        dstY0,
+        DST_W,
+        dstLines,
+        dmaBuf[nextDma]
+    );
+    tft->endWrite();
+
+    dmaSel = nextDma;
+    f->state = BUF_FREE;
+    frameCount++;
+}
+
+// ================= Setup =================
+void setup() {
+    Serial.begin(115200);
+
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(300);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected");
+
+    udp.begin(UDP_PORT);
+
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        frameBuf[i].state = BUF_FREE;
+    }
+
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->fillScreen(TFT_BLACK);
+    tft->setSwapBytes(true);
+
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(
+        DST_W * MAX_DST_LINES * sizeof(uint16_t),
+        MALLOC_CAP_DMA
+    );
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(
+        DST_W * MAX_DST_LINES * sizeof(uint16_t),
+        MALLOC_CAP_DMA
+    );
+
+    if (!dmaBuf[0] || !dmaBuf[1]) {
+        Serial.println("DMA alloc failed");
+        while (1);
+    }
+
+    xTaskCreatePinnedToCore(
+        udpReceiverTask,
+        "udp_rx",
+        8192,
+        nullptr,
+        2,
+        nullptr,
+        0
+    );
+}
+void printDebugInfo() {
+    static uint32_t lastPrint = 0;
+    uint32_t now = millis();
+    
+    if (now - lastPrint > 1000) {
+        lastPrint = now;
+        
+        Serial.printf("内存: %u, ", ESP.getFreeHeap());
+        Serial.printf("UDP包/秒: %u, ", udpPackets);
+        Serial.printf("丢包数: %u, ", dropCount);
+        Serial.printf("显示帧数: %u, ", frameCount);
+        
+        // 显示缓冲区状态
+        Serial.print("缓冲区状态: ");
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            switch(frameBuf[i].state) {
+                case BUF_FREE: Serial.print("F"); break;
+                case BUF_FILLING: Serial.print("I"); break;
+                case BUF_READY: Serial.print("R"); break;
+                case BUF_DISPLAYING: Serial.print("D"); break;
+            }
+        }
+        Serial.println();
+        
+        udpPackets = 0;
+    }
+}
+// ================= Loop =================
+void loop() {
+    drawFrame();
+    printDebugInfo();
+}

@@ -1,0 +1,307 @@
+#include <WiFi.h>
+#include "common.h"
+
+// WiFi配置
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiServer tcpServer(8888);
+WiFiClient tcpClient;
+#define TCP_PORT 8888
+#define RGB_LINE_BATCH 12   // 每次接收行数
+
+// 图像参数
+#define IMG_W 240
+#define IMG_H 240
+
+// ------------------------- 双缓冲结构 -------------------------
+struct FrameData {
+    uint16_t y_start;
+    uint16_t line_count;
+    uint16_t lines[RGB_LINE_BATCH * IMG_W];
+};
+
+FrameData frameBuffers[2];       // 双缓冲区
+volatile bool frameReady[2] = {false, false};
+volatile uint8_t currentBuf = 0; // 0或1
+
+// ------------------------- 全局运行数据 -------------------------
+struct ScreenShareAppRunData
+{
+    uint16_t *displayBufWithDma[2];
+    bool dmaBufferSel;
+    unsigned long frame_count;
+    SemaphoreHandle_t bufferMutex;  // 添加互斥锁
+};
+static ScreenShareAppRunData *run_data = NULL;
+
+// ------------------------- 初始化数据 -------------------------
+int initdata() {
+    run_data = (ScreenShareAppRunData*)malloc(sizeof(ScreenShareAppRunData));
+    if (!run_data) return -1;
+    memset(run_data, 0, sizeof(ScreenShareAppRunData));
+
+    run_data->displayBufWithDma[0] = (uint16_t*)heap_caps_malloc(IMG_W * RGB_LINE_BATCH * 2, MALLOC_CAP_DMA);
+    run_data->displayBufWithDma[1] = (uint16_t*)heap_caps_malloc(IMG_W * RGB_LINE_BATCH * 2, MALLOC_CAP_DMA);
+    if (!run_data->displayBufWithDma[0] || !run_data->displayBufWithDma[1]) {
+        free(run_data);
+        return -1;
+    }
+
+    run_data->dmaBufferSel = false;
+    run_data->frame_count = 0;
+    run_data->bufferMutex = xSemaphoreCreateMutex();  // 创建互斥锁
+    
+    return 0;
+}
+
+// ------------------------- TCP 接收任务 -------------------------
+void tcpReceiverTask(void *parameter) {
+    uint8_t header[6];
+    uint32_t packetCounter = 0;
+    
+    while (1) {
+        // 检查WiFi连接状态
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected, restarting...");
+            esp_restart();
+        }
+        
+        // 等待客户端连接
+        if (!tcpClient || !tcpClient.connected()) {
+            tcpClient = tcpServer.available();
+            if (tcpClient) {
+                Serial.println("New TCP client connected!");
+                // 设置超时和缓冲区大小
+                tcpClient.setTimeout(10);
+                tcpClient.setNoDelay(true);  // 禁用Nagle算法
+                packetCounter = 0;
+            }
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        // 检查是否有数据（非阻塞）
+        int available = tcpClient.available();
+        if (available <= 0) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        // 重要：定期喂狗
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+
+        // 只处理一个完整的数据包，避免长时间占用CPU
+        if (available >= 6) {  // 至少要有包头
+            // 读取包头
+            int headerRead = tcpClient.readBytes(header, 6);
+            if (headerRead != 6) {
+                tcpClient.stop();
+                Serial.println("Failed to read header");
+                continue;
+            }
+
+            uint16_t frame_id   = (header[0] << 8) | header[1];
+            uint16_t y_start    = (header[2] << 8) | header[3];
+            uint16_t line_count = (header[4] << 8) | header[5];
+
+            // 验证数据
+            if (line_count == 0 || line_count > RGB_LINE_BATCH) {
+                // 丢弃无效数据
+                tcpClient.flush();
+                continue;
+            }
+
+            uint32_t expected_size = IMG_W * line_count * 2;
+            
+            // 等待完整数据到达
+            uint32_t startWait = millis();
+            while (tcpClient.available() < expected_size) {
+                if (millis() - startWait > 100) {  // 100ms超时
+                    tcpClient.stop();
+                    Serial.println("Data timeout");
+                    break;
+                }
+                vTaskDelay(1 / portTICK_PERIOD_MS);
+            }
+            
+            if (!tcpClient.connected()) {
+                continue;
+            }
+
+            // 使用动态分配避免栈溢出
+            uint16_t* buf = (uint16_t*)malloc(expected_size);
+            if (!buf) {
+                Serial.println("Failed to allocate buffer");
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+                continue;
+            }
+
+            // 读取数据
+            int dataRead = tcpClient.readBytes((uint8_t*)buf, expected_size);
+            if (dataRead != expected_size) {
+                free(buf);
+                tcpClient.stop();
+                Serial.println("Incomplete data");
+                continue;
+            }
+
+            // byteswap
+            for (int i = 0; i < IMG_W * line_count; i++) {
+                uint16_t c = buf[i];
+                buf[i] = (c << 8) | (c >> 8);
+            }
+
+            // 使用互斥锁保护缓冲区
+            if (xSemaphoreTake(run_data->bufferMutex, portMAX_DELAY) == pdTRUE) {
+                uint8_t bufIndex = currentBuf;
+                FrameData* f = &frameBuffers[bufIndex];
+                f->y_start = y_start;
+                f->line_count = line_count;
+                memcpy(f->lines, buf, expected_size);
+                frameReady[bufIndex] = true;
+                currentBuf = !currentBuf;
+                xSemaphoreGive(run_data->bufferMutex);
+                
+                packetCounter++;
+                if (packetCounter % 100 == 0) {
+                    Serial.printf("Received %u packets\n", packetCounter);
+                }
+            }
+
+            free(buf);
+        }
+        
+        // 重要：让出CPU时间
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+
+// ------------------------- 显示任务 -------------------------
+void draw_frame_task() {
+    if (xSemaphoreTake(run_data->bufferMutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+        for (uint8_t i = 0; i < 2; i++) {
+            if (frameReady[i]) {
+                FrameData* f = &frameBuffers[i];
+                uint16_t* dmaBuf = run_data->displayBufWithDma[run_data->dmaBufferSel];
+
+                tft->dmaWait();  // 等待上一帧DMA完成
+                tft->startWrite();
+                tft->pushImageDMA(
+                    0,
+                    f->y_start,
+                    IMG_W,
+                    f->line_count,
+                    f->lines,
+                    dmaBuf
+                );
+                tft->endWrite();
+
+                run_data->dmaBufferSel = !run_data->dmaBufferSel;
+                frameReady[i] = false;
+                run_data->frame_count++;
+            }
+        }
+        xSemaphoreGive(run_data->bufferMutex);
+    }
+}
+
+// ------------------------- Arduino setup -------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(1000);  // 给串口时间初始化
+    
+    Serial.println("\n\nStarting screen sharing...");
+
+    // 连接WiFi（带超时）
+    WiFi.begin(ssid, password);
+    
+    unsigned long startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+        delay(500);
+        Serial.print(".");
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nFailed to connect to WiFi!");
+        esp_restart();
+    }
+    
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+    // 初始化数据
+    if (initdata() != 0) {
+        Serial.println("Failed to initialize data!");
+        while(1);
+    }
+
+    // 启动TCP服务器
+    tcpServer.begin();
+    tcpServer.setNoDelay(true);
+    Serial.printf("TCP server started on port %d\n", TCP_PORT);
+
+    // 初始化屏幕（先配置看门狗）
+    // 配置任务看门狗
+    // esp_task_wdt_init(5, true);  // 5秒超时
+    // esp_task_wdt_add(NULL);      // 添加当前任务到看门狗
+    
+    // 屏幕初始化（可能你的屏幕库需要特定参数）
+    // 根据实际使用的库修改
+    screen.init(4, 100);
+    
+    // 检查屏幕库的初始化
+    if (tft == NULL) {
+        Serial.println("TFT object is NULL, check your common.h!");
+        while(1);
+    }
+    
+    tft->initDMA();
+    tft->setSwapBytes(false);
+    tft->fillScreen(TFT_RED);
+    delay(100);
+    tft->fillScreen(TFT_GREEN);
+    delay(100);
+    tft->fillScreen(TFT_BLUE);
+    delay(100);
+    tft->fillScreen(TFT_BLACK);
+
+    Serial.println("Screen initialized!");
+
+    // 创建TCP接收任务（降低栈大小以避免内存问题）
+    xTaskCreatePinnedToCore(
+        tcpReceiverTask,
+        "TCP Receiver",
+        8192,  // 减小栈大小
+        NULL,
+        2,     // 中等优先级
+        NULL,
+        0      // 核心0
+    );
+    
+    Serial.println("TCP receiver task created on core 0");
+}
+
+// ------------------------- Arduino loop -------------------------
+void loop() {
+    // 喂狗
+    // esp_task_wdt_reset();
+    
+    screen.routine();
+
+    // 绘制最新帧
+    draw_frame_task();
+
+    static unsigned long lastTime = 0;
+    if (millis() - lastTime > 2000) {
+        lastTime = millis();
+        Serial.printf("Heap: %d, Frames: %lu, TCP: %d\n",
+                      ESP.getFreeHeap(),
+                      run_data->frame_count,
+                      (tcpClient && tcpClient.connected()) ? 1 : 0);
+    }
+    
+    // 重要：让出CPU时间
+    delay(1);
+}

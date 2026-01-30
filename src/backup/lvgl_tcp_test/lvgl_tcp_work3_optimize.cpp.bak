@@ -1,0 +1,210 @@
+#include <WiFi.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+#define TCP_PORT 8888
+WiFiServer tcpServer(TCP_PORT);
+WiFiClient tcpClient;
+
+// ================= Image =================
+#define IMG_W 240
+#define IMG_H 240
+#define MAX_LINES_PER_PACKET 20
+#define BUFFER_SIZE (IMG_W * MAX_LINES_PER_PACKET * 2)
+
+// ================= FrameBuffer (双缓冲) =================
+struct FrameBuffer {
+    uint16_t y_start;
+    uint16_t line_count;
+    uint16_t lines[IMG_W * MAX_LINES_PER_PACKET];
+};
+
+#define NUM_BUFFERS 4
+static FrameBuffer frameBuffers[NUM_BUFFERS];
+static volatile uint8_t writeBufferIndex = 0;
+
+// ================= Run Data =================
+struct ScreenShareAppRunData {
+    uint16_t *dmaBuf[2];
+    bool dmaSel;
+
+    QueueHandle_t displayQueue;
+    SemaphoreHandle_t freeBufferSem;
+
+    unsigned long frame_count;
+    unsigned long packet_count;
+    unsigned long error_count;
+    unsigned long last_packet_time;
+};
+
+static ScreenShareAppRunData *run_data = nullptr;
+static volatile bool flowControl = false;
+
+// ================= Init =================
+int initdata() {
+    run_data = (ScreenShareAppRunData*)calloc(1, sizeof(ScreenShareAppRunData));
+    if (!run_data) return -1;
+
+    run_data->dmaBuf[0] = (uint16_t*)heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA);
+    run_data->dmaBuf[1] = (uint16_t*)heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA);
+    if (!run_data->dmaBuf[0] || !run_data->dmaBuf[1]) return -1;
+
+    run_data->displayQueue = xQueueCreate(10, sizeof(uint8_t));
+    run_data->freeBufferSem = xSemaphoreCreateCounting(NUM_BUFFERS, NUM_BUFFERS);
+
+    run_data->dmaSel = false;
+    run_data->last_packet_time = millis();
+    return 0;
+}
+
+// ================= Utils =================
+bool readBytesWithTimeout(WiFiClient &c, uint8_t *buf, size_t len, uint32_t timeout_ms) {
+    size_t recv = 0;
+    uint32_t start = millis();
+    while (recv < len) {
+        if (millis() - start > timeout_ms) return false;
+        if (c.available()) {
+            recv += c.read(buf + recv, len - recv);
+            run_data->last_packet_time = millis();
+        }
+        vTaskDelay(1);
+    }
+    return true;
+}
+
+// ================= TCP Receiver Task =================
+void tcpReceiverTask(void *) {
+    uint8_t header[6];
+    uint16_t *rxBuf = (uint16_t*)malloc(BUFFER_SIZE);
+    if (!rxBuf) vTaskDelete(nullptr);
+
+    while (1) {
+        if (!tcpClient || !tcpClient.connected()) {
+            tcpClient = tcpServer.available();
+            vTaskDelay(50);
+            continue;
+        }
+
+        // if (millis() - run_data->last_packet_time > 5000) {
+        //     tcpClient.stop();
+        //     continue;
+        // }
+
+        // ==== 关键：先占 buffer ====
+        if (xSemaphoreTake(run_data->freeBufferSem, 0) != pdTRUE) {
+            flowControl = true;
+            if (tcpClient.available() > 1000) {
+                Serial.println("数据内容太多了");
+                tcpClient.flush();
+            }
+            vTaskDelay(5);
+            continue;
+        }
+        flowControl = false;
+
+        if (!readBytesWithTimeout(tcpClient, header, 6, 100)) {
+            xSemaphoreGive(run_data->freeBufferSem);
+            Serial.println("读取数据过100ms");
+            continue;
+        }
+
+        uint16_t y = (header[2] << 8) | header[3];
+        uint16_t lines = (header[4] << 8) | header[5];
+        if (lines == 0 || lines > MAX_LINES_PER_PACKET) {
+            xSemaphoreGive(run_data->freeBufferSem);
+            continue;
+        }
+
+        uint32_t size = IMG_W * lines * 2;
+        if (!readBytesWithTimeout(tcpClient, (uint8_t*)rxBuf, size, 200)) {
+            xSemaphoreGive(run_data->freeBufferSem);
+            tcpClient.stop();
+            continue;
+        }
+
+        uint8_t idx = writeBufferIndex;
+        FrameBuffer *f = &frameBuffers[idx];
+        f->y_start = y;
+        f->line_count = lines;
+        memcpy(f->lines, rxBuf, size);
+
+        writeBufferIndex = (writeBufferIndex + 1) % NUM_BUFFERS;
+
+        xQueueSend(run_data->displayQueue, &idx, 0);
+        run_data->packet_count++;
+    }
+}
+
+// ================= Display Task =================
+void displayTask(void *) {
+    uint8_t idx;
+    while (1) {
+        if (xQueueReceive(run_data->displayQueue, &idx, portMAX_DELAY)) {
+            FrameBuffer *f = &frameBuffers[idx];
+            uint16_t *dma = run_data->dmaBuf[run_data->dmaSel];
+
+            tft->dmaWait();
+            tft->startWrite();
+            tft->pushImageDMA(
+                0,
+                f->y_start,
+                IMG_W,
+                f->line_count,
+                f->lines,
+                dma
+            );
+            tft->endWrite();
+
+            run_data->dmaSel = !run_data->dmaSel;
+            run_data->frame_count++;
+
+            // ==== 释放 buffer ====
+            xSemaphoreGive(run_data->freeBufferSem);
+        }
+    }
+}
+
+// ================= Arduino =================
+void setup() {
+    Serial.begin(115200);
+
+    WiFi.setSleep(false);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) delay(200);
+
+    tcpServer.begin();
+    tcpServer.setNoDelay(true);
+
+    if (initdata() != 0) {
+        Serial.println("init failed");
+        while (1);
+    }
+
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(true);
+    tft->fillScreen(TFT_BLACK);
+
+    xTaskCreatePinnedToCore(displayTask, "display", 4096, nullptr, 2, nullptr, 1);
+    xTaskCreatePinnedToCore(tcpReceiverTask, "tcp", 8192, nullptr, 3, nullptr, 0);
+}
+
+void loop() {
+    static uint32_t last = 0;
+    if (millis() - last > 2000) {
+        last = millis();
+        Serial.printf(
+            "FPS:%lu pkt/s:%lu heap:%u flow:%d\n",
+            run_data->frame_count / 2,
+            run_data->packet_count / 2,
+            ESP.getFreeHeap(),
+            flowControl
+        );
+        run_data->frame_count = 0;
+        run_data->packet_count = 0;
+    }
+    delay(1);
+}

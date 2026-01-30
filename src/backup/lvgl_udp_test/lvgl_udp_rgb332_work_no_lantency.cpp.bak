@@ -1,0 +1,207 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiUDP udp;
+#define UDP_PORT 8888
+
+// ================= Image =================
+#define IMG_W 240
+#define IMG_H 240
+#define RGB_LINE_BATCH 6   // UDP 每包最大行数
+
+// ================= DMA Buffers =================
+uint16_t* dmaBuf[2];
+volatile uint8_t writeBuf = 0;
+volatile uint8_t readBuf  = 1;
+volatile bool bufReady    = false;
+
+// 当前块显示参数（最新优先）
+volatile uint16_t currentY     = 0;
+volatile uint16_t currentLines = 0;
+
+// ================= Debug Counters =================
+volatile uint32_t udpPackets = 0;
+volatile uint32_t drawCalls  = 0;
+
+// ================= RGB332 → RGB565（快速映射） =================
+static inline uint16_t rgb332_to_rgb565(uint8_t c)
+{
+    return ((c & 0xE0) << 8) |   // R: 3 → 5
+           ((c & 0x1C) << 6) |   // G: 3 → 6
+           ((c & 0x03) << 3);    // B: 2 → 5
+}
+
+// ================= Init DMA Buffers =================
+bool initBuffers()
+{
+    for (int i = 0; i < 2; i++) {
+        dmaBuf[i] = (uint16_t*)heap_caps_malloc(
+            IMG_W * RGB_LINE_BATCH * sizeof(uint16_t),
+            MALLOC_CAP_DMA
+        );
+        if (!dmaBuf[i]) return false;
+    }
+    return true;
+}
+
+// ================= UDP Receiver Task =================
+void udpReceiverTask(void *parameter)
+{
+    uint8_t rgbBuf[IMG_W * RGB_LINE_BATCH];
+    uint8_t header[6];
+
+    while (1) {
+        int packetSize = udp.parsePacket();
+        if (packetSize <= 0) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        // --- Header ---
+        if (udp.read(header, 6) != 6) {
+            Serial.println("[UDP] header read failed");
+            continue;
+        }
+
+        uint16_t y_start =
+            (uint16_t(header[2]) << 8) | header[3];
+        uint16_t line_count =
+            (uint16_t(header[4]) << 8) | header[5];
+
+        if (line_count == 0 || line_count > RGB_LINE_BATCH) {
+            Serial.printf(
+                "[UDP] bad line_count=%u\n",
+                line_count
+            );
+            udp.flush();
+            continue;
+        }
+
+        uint32_t dataSize = IMG_W * line_count;
+        if (udp.read(rgbBuf, dataSize) != dataSize) {
+            Serial.println("[UDP] payload read failed");
+            continue;
+        }
+
+        // --- RGB332 → RGB565 ---
+        uint16_t* out = dmaBuf[writeBuf];
+        for (uint32_t i = 0; i < dataSize; i++) {
+            out[i] = rgb332_to_rgb565(rgbBuf[i]);
+        }
+
+        // --- 更新“最新状态” ---
+        currentY     = y_start;
+        currentLines = line_count;
+
+        // --- 原子交换 buffer ---
+        uint8_t old = readBuf;
+        readBuf  = writeBuf;
+        writeBuf = old;
+
+        bufReady = true;
+        udpPackets++;
+
+        if ((udpPackets % 1000) == 0) {
+            Serial.printf(
+                "[UDP] packets=%lu y=%u lines=%u\n",
+                udpPackets, y_start, line_count
+            );
+        }
+    }
+}
+
+// ================= Display =================
+void drawLatest()
+{
+    if (!bufReady) return;
+
+    bufReady = false;
+    drawCalls++;
+
+    tft->dmaWait();
+    tft->startWrite();
+    tft->pushImageDMA(
+        0,
+        currentY,
+        IMG_W,
+        currentLines,
+        dmaBuf[readBuf]
+    );
+    tft->endWrite();
+
+    if ((drawCalls % 1000) == 0) {
+        Serial.printf(
+            "[DRAW] calls=%lu y=%u lines=%u\n",
+            drawCalls, currentY, currentLines
+        );
+    }
+}
+
+// ================= Arduino =================
+void setup()
+{
+    Serial.begin(115200);
+    delay(500);
+
+    Serial.println("\n[SYS] boot");
+
+    // --- WiFi ---
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(300);
+        Serial.print(".");
+    }
+    Serial.println("\n[SYS] WiFi connected");
+    Serial.print("[SYS] IP: ");
+    Serial.println(WiFi.localIP());
+
+    // --- DMA Buffers ---
+    if (!initBuffers()) {
+        Serial.println("[ERR] DMA buffer alloc failed");
+        while (1);
+    }
+
+    // --- UDP ---
+    udp.begin(UDP_PORT);
+    Serial.printf("[SYS] UDP listen on %d\n", UDP_PORT);
+
+    // --- TFT ---
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(true);
+    tft->fillScreen(TFT_BLACK);
+
+    // --- UDP Task ---
+    xTaskCreatePinnedToCore(
+        udpReceiverTask,
+        "udp_rx",
+        4096,
+        NULL,
+        3,
+        NULL,
+        0
+    );
+
+    Serial.println("[SYS] setup done");
+}
+
+void loop()
+{
+    drawLatest();
+
+    static uint32_t last = 0;
+    if (millis() - last > 2000) {
+        last = millis();
+        Serial.printf(
+            "[STAT] udp=%lu draw=%lu heap=%u\n",
+            udpPackets,
+            drawCalls,
+            ESP.getFreeHeap()
+        );
+    }
+}

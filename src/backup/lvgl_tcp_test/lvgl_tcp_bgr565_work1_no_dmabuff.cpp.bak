@@ -1,0 +1,137 @@
+#include <WiFi.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+#define TCP_PORT 8888
+
+WiFiServer server(TCP_PORT);
+WiFiClient client;
+#define IMG_W 120
+
+#define MAX_LINES_PER_PACKET 60   // 减少到6行，平衡速度和稳定性
+#define BUFFER_SIZE (IMG_W * MAX_LINES_PER_PACKET * 2)
+uint16_t lines[IMG_W * MAX_LINES_PER_PACKET];
+
+
+unsigned long last_packet_time = millis();
+// ------------------------- 工具函数 -------------------------
+bool readBytesWithTimeout(WiFiClient &client, uint8_t *buffer, size_t size, uint32_t timeout_ms) {
+    unsigned long startTime = millis();
+    size_t bytesRead = 0;
+    
+    while (bytesRead < size) {
+        if (millis() - startTime > timeout_ms) {
+            return false; // 超时
+        }
+        
+        if (client.available() > 0) {
+            bytesRead += client.read(buffer + bytesRead, size - bytesRead);
+            last_packet_time = millis(); // 更新最后接收时间
+        }
+        
+        // 小延迟避免忙等待
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+    
+    return true;
+}
+
+
+// ================= SETUP =================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("\n===== ESP32 MJPEG STREAM (NO PSRAM) =====");
+    Serial.printf("psramFound(): %s\n", psramFound() ? "YES" : "NO");
+
+    // ---- WiFi ----
+    WiFi.setSleep(false);
+    WiFi.begin(ssid, password);
+
+    Serial.print("Connecting WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+    server.begin();
+    server.setNoDelay(true);
+    Serial.printf("TCP server started @ %d\n", TCP_PORT);
+
+    // ---- Screen ----
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(true);
+    tft->fillScreen(TFT_BLACK);
+}
+
+
+
+// ================= LOOP =================
+void loop() {
+
+    // 等客户端连接
+    if (!client || !client.connected()) {
+        client = server.available();
+        if (client) {
+            Serial.println("[TCP] Client connected");
+        }
+        delay(5);
+        return;
+    }
+
+    // 没数据就不读
+    if (!client.available()) {
+        delay(1);
+        return;
+    }
+
+    uint8_t header[6];
+    if (client.read(header, 6) != 6) return;
+
+    uint16_t frame_id   = (header[0] << 8) | header[1];
+    uint16_t y_start    = (header[2] << 8) | header[3];
+    uint16_t line_count = (header[4] << 8) | header[5];
+    Serial.printf("fid=%d, y=%d, count=%d\n", frame_id, y_start, line_count);
+    if (line_count == 0 || line_count > MAX_LINES_PER_PACKET) {
+        client.stop();
+        return;
+    }
+    uint16_t *rxBuffer = (uint16_t*)malloc(BUFFER_SIZE);
+    if (!rxBuffer) {
+        Serial.println("Failed to allocate rxBuffer!");
+        return;
+    }
+    uint32_t expected_size = IMG_W * line_count * 2;
+        
+        // 读取数据（带超时）
+    if (!readBytesWithTimeout(client, (uint8_t*)rxBuffer, expected_size, 200)) {
+        Serial.println("Data read timeout");
+        client.stop();  // 数据不完整，断开重连
+        if(rxBuffer)free(rxBuffer);
+        return;
+    }
+
+     // 快速拷贝
+    memcpy(lines, rxBuffer, expected_size);
+
+    // ★ 关键：流式喂给 TJpgDec
+    tft->dmaWait();
+    tft->startWrite();
+    tft->pushImageDMA(
+        0,
+        y_start,
+        IMG_W,
+        line_count,
+        lines,
+        nullptr
+    );
+    tft->endWrite();     
+    if(rxBuffer)free(rxBuffer);       
+}

@@ -1,0 +1,263 @@
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiServer.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiServer server(8888);
+WiFiClient client;
+
+// ================= Image =================
+#define IMG_W 240
+#define RGB_LINE_BATCH 18
+
+// ================= Frame Buffer =================
+#define FRAME_BUF_COUNT 5
+
+enum BufState {
+    BUF_FREE,
+    BUF_FILLING,
+    BUF_READY,
+    BUF_DISPLAYING
+};
+
+struct FrameData {
+    uint16_t y_start;
+    uint16_t line_count;
+    uint16_t lines[RGB_LINE_BATCH * IMG_W];
+    volatile BufState state;
+};
+
+FrameData frameBuf[FRAME_BUF_COUNT];
+
+// ================= DMA =================
+uint16_t* dmaBuf[2];
+volatile uint8_t dmaSel = 0;
+
+// ================= Stats =================
+volatile uint32_t frameCount = 0;
+volatile uint32_t dropCount  = 0;
+volatile uint32_t tcpPackets = 0;
+
+// ================= Utils =================
+static inline uint16_t bswap16(uint16_t v) {
+    return (v << 8) | (v >> 8);
+}
+
+// ================= TCP Receiver Task =================
+void tcpReceiverTask(void* param) {
+    while (1) {
+        // 等待客户端连接
+        if (!client || !client.connected()) {
+            client = server.available();
+            if (client) {
+                Serial.println("TCP客户端已连接");
+                // 设置TCP_NODELAY以减少延迟
+                client.setNoDelay(true);
+                // 设置较大的接收缓冲区
+                // client.setRxBufferSize(8192);
+            }
+            vTaskDelay(100);
+            continue;
+        }
+
+        // 检查是否有数据可读
+        if (client.available() < 6) {
+            vTaskDelay(1);
+            continue;
+        }
+        
+
+        // 读取头部
+        uint8_t header[6];
+        client.readBytes(header, 6);
+        tcpPackets++;
+        
+        uint16_t frame_id = (header[0] << 8) | header[1];
+        uint16_t y_start  = (header[2] << 8) | header[3];
+        uint16_t line_count = (header[4] << 8) | header[5];
+
+        if (line_count == 0 || line_count > RGB_LINE_BATCH) {
+            continue;
+        }
+
+        uint32_t expect = IMG_W * line_count * 2;
+        Serial.printf(".");
+        // 等待数据完整到达
+        while (client.available() < expect) {
+            vTaskDelay(1);
+            if (!client.connected()) {
+                Serial.println("TCP连接断开");
+                return;
+            }
+        }
+
+        // 找FREE buffer
+        FrameData* f = nullptr;
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            if (frameBuf[i].state == BUF_FREE) {
+                f = &frameBuf[i];
+                f->state = BUF_FILLING;
+                break;
+            }
+        }
+
+        if (!f) {
+            // 没FREE，丢弃数据
+            dropCount++;
+            // 跳过数据
+            for (uint32_t i = 0; i < expect; i++) {
+                client.read();
+            }
+            Serial.println("没有空闲的FrameBuffer");
+            continue;
+        }
+
+        // 读取数据
+        client.readBytes((uint8_t*)f->lines, expect);
+
+        f->y_start = y_start;
+        f->line_count = line_count;
+        f->state = BUF_READY;
+    }
+}
+
+// ================= Draw Frame =================
+void drawFrame() {
+    // 按顺序消费，避免撕裂
+    FrameData* newest = nullptr;
+    int newestIdx = -1;
+    
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        if (frameBuf[i].state == BUF_READY) {
+            newest = &frameBuf[i];
+            newestIdx = i;
+            break;
+        }
+    }
+
+    if (!newest) return;
+
+    newest->state = BUF_DISPLAYING;
+
+    uint8_t nextDma = dmaSel ^ 1;
+
+    // 等待DMA完成
+    tft->dmaWait();
+
+    memcpy(
+        dmaBuf[nextDma],
+        newest->lines,
+        IMG_W * newest->line_count * 2
+    );
+
+    tft->startWrite();
+    tft->pushImageDMA(
+        0,
+        newest->y_start,
+        IMG_W,
+        newest->line_count,
+        dmaBuf[nextDma]
+    );
+    tft->endWrite();
+
+    dmaSel = nextDma;
+    newest->state = BUF_FREE;
+    frameCount++;
+}
+
+// ================= 调试输出 =================
+void printDebugInfo() {
+    static uint32_t lastPrint = 0;
+    uint32_t now = millis();
+    
+    if (now - lastPrint > 1000) {
+        lastPrint = now;
+        
+        Serial.printf("内存: %u, ", ESP.getFreeHeap());
+        Serial.printf("TCP包/秒: %u, ", tcpPackets);
+        Serial.printf("丢包数: %u, ", dropCount);
+        Serial.printf("显示帧数: %u, ", frameCount);
+        Serial.printf("客户端连接: %s", client.connected() ? "是" : "否");
+        
+        // 显示缓冲区状态
+        Serial.print(" 缓冲区状态: ");
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            switch(frameBuf[i].state) {
+                case BUF_FREE: Serial.print("F"); break;
+                case BUF_FILLING: Serial.print("I"); break;
+                case BUF_READY: Serial.print("R"); break;
+                case BUF_DISPLAYING: Serial.print("D"); break;
+            }
+        }
+        Serial.println();
+        
+        tcpPackets = 0;
+    }
+}
+
+// ================= Setup =================
+void setup() {
+    Serial.begin(115200);
+
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(300);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi连接成功");
+    Serial.print("IP地址: ");
+    Serial.println(WiFi.localIP());
+
+    // 启动TCP服务器
+    server.begin();
+    Serial.println("TCP服务器已启动，端口: 8888");
+
+    // 初始化缓冲区
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        frameBuf[i].state = BUF_FREE;
+    }
+
+    // 初始化屏幕
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(true);
+
+    // 分配DMA缓冲区
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(
+        IMG_W * RGB_LINE_BATCH * 2,
+        MALLOC_CAP_DMA
+    );
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(
+        IMG_W * RGB_LINE_BATCH * 2,
+        MALLOC_CAP_DMA
+    );
+
+    if (!dmaBuf[0] || !dmaBuf[1]) {
+        Serial.println("DMA内存分配失败");
+        while (1);
+    }
+
+    // 创建TCP接收任务
+    xTaskCreatePinnedToCore(
+        tcpReceiverTask,
+        "tcp_rx",
+        16384,  // 增大栈大小
+        nullptr,
+        2,
+        nullptr,
+        0
+    );
+    
+    tft->fillScreen(TFT_BLACK);
+    Serial.println("初始化完成");
+}
+
+// ================= Loop =================
+void loop() {
+    drawFrame();
+    printDebugInfo();
+}

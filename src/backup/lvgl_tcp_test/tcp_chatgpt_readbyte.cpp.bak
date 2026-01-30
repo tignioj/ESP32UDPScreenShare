@@ -1,0 +1,217 @@
+#include <WiFi.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiServer server(8888);
+WiFiClient client;
+
+// ================= Image =================
+#define IMG_W 240
+#define RGB_LINE_BATCH 18
+
+// ================= Frame Buffer =================
+#define FRAME_BUF_COUNT 5
+
+enum BufState {
+    BUF_FREE,
+    BUF_FILLING,
+    BUF_READY,
+    BUF_DISPLAYING
+};
+
+struct FrameData {
+    uint16_t y_start;
+    uint16_t line_count;
+    uint16_t lines[RGB_LINE_BATCH * IMG_W];
+    volatile BufState state;
+};
+
+FrameData frameBuf[FRAME_BUF_COUNT];
+
+// ================= DMA =================
+uint16_t* dmaBuf[2];
+volatile uint8_t dmaSel = 0;
+
+// ================= Stats =================
+volatile uint32_t frameCount = 0;
+volatile uint32_t dropCount  = 0;
+volatile uint32_t tcpPackets = 0;
+
+// ================= TCP utils =================
+bool readFully(WiFiClient& c, uint8_t* buf, size_t len) {
+    size_t off = 0;
+    uint32_t last = millis();
+
+    while (off < len) {
+        if (!c.connected()) return false;
+
+        int r = c.read(buf + off, len - off);
+        if (r > 0) {
+            off += r;
+            last = millis();
+        } else {
+            // 没数据 ≠ 断线
+            if (millis() - last > 2000) {
+                // 2 秒都没数据，认为异常
+                return false;
+            }
+            vTaskDelay(1);
+        }
+    }
+    return true;
+}
+
+
+// ================= TCP Receiver Task =================
+void tcpReceiverTask(void* param) {
+    while (1) {
+        unsigned long start_time = millis();
+        if (!client || !client.connected()) {
+            client = server.available();
+            vTaskDelay(10);
+            continue;
+        }
+
+        uint8_t header[6];
+        if (!readFully(client, header, 6)) {
+            client.stop();
+            continue;
+        }
+
+        tcpPackets++;
+
+        uint16_t y_start    = (header[2] << 8) | header[3];
+        uint16_t line_count = (header[4] << 8) | header[5];
+
+        if (line_count == 0 || line_count > RGB_LINE_BATCH) {
+            dropCount++;
+            continue;
+        }
+
+        uint32_t payloadSize = IMG_W * line_count * 2;
+
+        FrameData* f = nullptr;
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            if (frameBuf[i].state == BUF_FREE) {
+                f = &frameBuf[i];
+                f->state = BUF_FILLING;
+                break;
+            }
+        }
+
+        if (!f) {
+            dropCount++;
+            // 丢弃 payload
+            uint8_t dump[64];
+            while (payloadSize > 0) {
+                int r = client.read(dump, min((uint32_t)64, payloadSize));
+                if (r <= 0) break;
+                payloadSize -= r;
+            }
+            continue;
+        }
+        unsigned long before_read_time = millis();
+        if (!readFully(client, (uint8_t*)f->lines, payloadSize)) {
+            f->state = BUF_FREE;
+            client.stop();
+            continue;
+        }
+        Serial.printf("readFully time=%lu\n", millis()-before_read_time);
+        f->y_start = y_start;
+        f->line_count = line_count;
+        f->state = BUF_READY;
+        Serial.printf("tcp one time=%lu\n", millis()-start_time);
+    }
+}
+
+// ================= Draw =================
+void drawFrame() {
+    FrameData* f = nullptr;
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        if (frameBuf[i].state == BUF_READY) {
+            f = &frameBuf[i];
+            break;
+        }
+    }
+    if (!f) return;
+
+    f->state = BUF_DISPLAYING;
+
+    uint8_t next = dmaSel ^ 1;
+    tft->dmaWait();
+
+    memcpy(dmaBuf[next], f->lines, IMG_W * f->line_count * 2);
+
+    tft->startWrite();
+    tft->pushImageDMA(0, f->y_start, IMG_W, f->line_count, dmaBuf[next]);
+    tft->endWrite();
+
+    dmaSel = next;
+    f->state = BUF_FREE;
+    frameCount++;
+}
+
+// ================= Debug =================
+void printDebugInfo() {
+    static uint32_t last = 0;
+    if (millis() - last < 1000) return;
+    last = millis();
+
+    Serial.printf(
+        "heap=%u tcp/s=%u drop=%u frame=%u buf=",
+        ESP.getFreeHeap(),
+        tcpPackets,
+        dropCount,
+        frameCount
+    );
+
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        char c = "FIRD"[frameBuf[i].state];
+        Serial.print(c);
+    }
+    Serial.println();
+
+    tcpPackets = 0;
+}
+
+// ================= Setup =================
+void setup() {
+    Serial.begin(115200);
+
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) delay(300);
+
+    server.begin();
+    server.setNoDelay(true);
+
+    for (int i = 0; i < FRAME_BUF_COUNT; i++)
+        frameBuf[i].state = BUF_FREE;
+
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(true);
+
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(IMG_W * RGB_LINE_BATCH * 2, MALLOC_CAP_DMA);
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(IMG_W * RGB_LINE_BATCH * 2, MALLOC_CAP_DMA);
+
+    xTaskCreatePinnedToCore(
+        tcpReceiverTask,
+        "tcp_rx",
+        8192,
+        nullptr,
+        2,
+        nullptr,
+        0
+    );
+
+    tft->fillScreen(TFT_BLACK);
+}
+
+// ================= Loop =================
+void loop() {
+    drawFrame();
+    printDebugInfo();
+}

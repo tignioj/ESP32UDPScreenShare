@@ -1,0 +1,356 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiUDP udp;
+#define UDP_PORT 8888
+
+// ================= Image =================
+#define IMG_W 240
+#define RGB_LINE_BATCH 3
+
+// ================= Frame Buffer Queue =================
+#define FRAME_BUF_COUNT 12
+
+enum BufState {
+    BUF_FREE,
+    BUF_FILLING,
+    BUF_READY,
+    BUF_DISPLAYING
+};
+
+struct FrameData {
+    uint16_t y_start;
+    uint16_t line_count;
+    uint16_t lines[RGB_LINE_BATCH * IMG_W];
+    volatile BufState state;
+};
+
+class FrameBufferQueue {
+private:
+    FrameData buffer[FRAME_BUF_COUNT];
+    volatile int head;  // 写指针（生产者）
+    volatile int tail;  // 读指针（消费者）
+    volatile int ready_count;  // 就绪帧数量
+    
+public:
+    FrameBufferQueue() : head(0), tail(0), ready_count(0) {
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            buffer[i].state = BUF_FREE;
+        }
+    }
+    
+    // 获取一个空闲buffer用于填充（生产者）
+    FrameData* acquireFreeBuffer() {
+        int current_head = head;
+        
+        // 检查队列是否已满
+        if (ready_count >= FRAME_BUF_COUNT - 1) {
+            return nullptr;
+        }
+        
+        if (buffer[current_head].state == BUF_FREE) {
+            buffer[current_head].state = BUF_FILLING;
+            return &buffer[current_head];
+        }
+        
+        return nullptr;
+    }
+    
+    // 完成填充，将buffer标记为就绪（生产者）
+    void markBufferReady(FrameData* frame) {
+        frame->state = BUF_READY;
+        head = (head + 1) % FRAME_BUF_COUNT;
+        
+        // 原子操作更新就绪计数
+        __sync_fetch_and_add(&ready_count, 1);
+    }
+    
+    // 获取一个就绪的buffer用于显示（消费者）
+    FrameData* getReadyBuffer() {
+        if (ready_count <= 0) {
+            return nullptr;
+        }
+        
+        int current_tail = tail;
+        
+        if (buffer[current_tail].state == BUF_READY) {
+            buffer[current_tail].state = BUF_DISPLAYING;
+            tail = (tail + 1) % FRAME_BUF_COUNT;
+            
+            // 原子操作更新就绪计数
+            __sync_fetch_and_sub(&ready_count, 1);
+            
+            return &buffer[current_tail];
+        }
+        
+        return nullptr;
+    }
+    
+    // 释放已显示的buffer（消费者）
+    void releaseBuffer(FrameData* frame) {
+        frame->state = BUF_FREE;
+    }
+    
+    // 获取就绪帧数量
+    int getReadyCount() const {
+        return ready_count;
+    }
+    
+    // 获取空闲buffer数量
+    int getFreeCount() const {
+        return FRAME_BUF_COUNT - ready_count - 1;  // -1 因为有一个可能正在填充
+    }
+    
+    // 清空队列（当需要重置时）
+    void clear() {
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            buffer[i].state = BUF_FREE;
+        }
+        head = 0;
+        tail = 0;
+        ready_count = 0;
+    }
+    
+    // 丢弃所有就绪的buffer（防堆积）
+    void discardAllReady() {
+        for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+            if (buffer[i].state == BUF_READY) {
+                buffer[i].state = BUF_FREE;
+            }
+        }
+        tail = head;
+        ready_count = 0;
+    }
+};
+
+FrameBufferQueue frameQueue;
+
+// ================= DMA =================
+uint16_t* dmaBuf[2];
+volatile uint8_t dmaSel = 0;
+
+// ================= Stats =================
+volatile uint32_t frameCount = 0;
+volatile uint32_t dropCount  = 0;
+volatile uint32_t udpPackets = 0;
+volatile uint32_t queueFullCount = 0;
+
+// ================= Utils =================
+static inline uint16_t bswap16(uint16_t v) {
+    return (v << 8) | (v >> 8);
+}
+
+// ================= UDP Receiver Task =================
+void udpReceiverTask(void* param) {
+    while (1) {
+        int packetSize = udp.parsePacket();
+        if (packetSize <= 0) {
+            vTaskDelay(1);
+            continue;
+        }
+        udpPackets++;
+        
+        uint8_t header[6];
+        if (udp.read(header, 6) != 6) continue;
+
+        uint16_t y_start    = (header[2] << 8) | header[3];
+        uint16_t line_count = (header[4] << 8) | header[5];
+
+        if (line_count == 0 || line_count > RGB_LINE_BATCH) {
+            udp.flush();
+            continue;
+        }
+
+        uint32_t expect = IMG_W * line_count * 2;
+
+        // 从队列获取空闲buffer
+        FrameData* f = frameQueue.acquireFreeBuffer();
+        
+        if (!f) {
+            // 队列已满，丢包
+            dropCount++;
+            queueFullCount++;
+            udp.flush();
+            
+            // 偶尔输出队列满的警告
+            static uint32_t lastQueueWarn = 0;
+            if (millis() - lastQueueWarn > 1000) {
+                Serial.printf("队列已满! 就绪帧: %d, 丢包: %u\n", 
+                              frameQueue.getReadyCount(), dropCount);
+                lastQueueWarn = millis();
+            }
+            continue;
+        }
+
+        if (udp.read((uint8_t*)f->lines, expect) != expect) {
+            f->state = BUF_FREE;  // 直接设置状态，因为不是通过队列接口
+            continue;
+        }
+
+        f->y_start = y_start;
+        f->line_count = line_count;
+        
+        // 标记buffer为就绪状态
+        frameQueue.markBufferReady(f);
+        
+        // 调试信息
+        static uint32_t lastDebug = 0;
+        if (millis() - lastDebug > 5000) {
+            Serial.printf("UDP接收中: 队列状态 %d/%d\n", 
+                         frameQueue.getReadyCount(), FRAME_BUF_COUNT);
+            lastDebug = millis();
+        }
+    }
+}
+
+// ================= Draw Frame =================
+void drawFrame() {
+    // 从队列获取就绪的buffer
+    FrameData* frame = frameQueue.getReadyBuffer();
+    
+    if (!frame) {
+        return;  // 没有就绪的帧
+    }
+
+    uint8_t nextDma = dmaSel ^ 1;
+
+    // 等待DMA完成
+    tft->dmaWait();
+
+    // 复制数据到DMA缓冲区
+    memcpy(
+        dmaBuf[nextDma],
+        frame->lines,
+        IMG_W * frame->line_count * 2
+    );
+
+    // 启动DMA传输
+    tft->startWrite();
+    tft->pushImageDMA(
+        0,
+        frame->y_start,
+        IMG_W,
+        frame->line_count,
+        dmaBuf[nextDma]
+    );
+    tft->endWrite();
+
+    dmaSel = nextDma;
+    
+    // 释放buffer
+    frameQueue.releaseBuffer(frame);
+    
+    frameCount++;
+    
+    // 如果队列堆积太多，丢弃旧的帧（可选，用于低延迟模式）
+    // if (frameQueue.getReadyCount() > 5) {
+    //     frameQueue.discardAllReady();
+    //     Serial.println("队列堆积，清空队列");
+    // }
+}
+
+// ================= 调试输出 =================
+void printDebugInfo() {
+    static uint32_t lastPrint = 0;
+    uint32_t now = millis();
+    
+    if (now - lastPrint > 1000) {
+        lastPrint = now;
+        
+        Serial.printf("内存: %u, ", ESP.getFreeHeap());
+        Serial.printf("UDP包/秒: %u, ", udpPackets);
+        Serial.printf("丢包数: %u, ", dropCount);
+        Serial.printf("队列满丢包: %u, ", queueFullCount);
+        Serial.printf("显示帧数: %u, ", frameCount);
+        Serial.printf("队列: %d/%d, ", 
+                     frameQueue.getReadyCount(), 
+                     FRAME_BUF_COUNT);
+        
+        // 队列填充率
+        int fillPercent = (frameQueue.getReadyCount() * 100) / FRAME_BUF_COUNT;
+        Serial.printf("填充率: %d%%", fillPercent);
+        
+        Serial.println();
+        
+        // 重置统计
+        udpPackets = 0;
+        queueFullCount = 0;
+    }
+}
+
+// ================= Setup =================
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n=== Frame Buffer Queue Demo ===");
+
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(300);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+
+    udp.begin(UDP_PORT);
+
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(true);
+
+    // 分配DMA缓冲区
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(
+        IMG_W * RGB_LINE_BATCH * 2,
+        MALLOC_CAP_DMA
+    );
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(
+        IMG_W * RGB_LINE_BATCH * 2,
+        MALLOC_CAP_DMA
+    );
+
+    if (!dmaBuf[0] || !dmaBuf[1]) {
+        Serial.println("DMA分配失败!");
+        while (1);
+    }
+
+    Serial.println("创建UDP接收任务...");
+    xTaskCreatePinnedToCore(
+        udpReceiverTask,
+        "udp_rx",
+        8192,
+        nullptr,
+        2,
+        nullptr,
+        0
+    );
+
+    tft->fillScreen(TFT_BLACK);
+    Serial.println("系统初始化完成!");
+}
+
+// ================= Loop =================
+void loop() {
+    drawFrame();
+    printDebugInfo();
+    
+    // 可选：监控队列状态并调整策略
+    static uint32_t lastQueueCheck = 0;
+    if (millis() - lastQueueCheck > 2000) {
+        lastQueueCheck = millis();
+        
+        int readyCount = frameQueue.getReadyCount();
+        if (readyCount > FRAME_BUF_COUNT / 2) {
+            // 队列半满，可以考虑提高显示频率
+            // 或者丢弃一些旧帧以降低延迟
+            if (readyCount > FRAME_BUF_COUNT * 3 / 4) {
+                // 队列接近满，丢弃一半旧帧
+                // frameQueue.discardOldFrames(FRAME_BUF_COUNT / 2);
+                Serial.println("警告: 队列接近满!");
+            }
+        }
+    }
+}

@@ -1,0 +1,176 @@
+#include <WiFi.h>
+#include <TJpg_Decoder.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+#define TCP_PORT 8888
+
+WiFiServer server(TCP_PORT);
+WiFiClient client;
+
+// ================= JPEG stream =================
+#define JPEG_CHUNK_SIZE 10240*5   // 小块流式输入
+static uint8_t jpegChunk[JPEG_CHUNK_SIZE];
+
+static uint32_t frameCount = 0;
+static uint32_t byteCount  = 0;
+
+// ================= TJpg callback =================
+// ⚠️ 函数签名必须完全一致
+bool tft_output(
+    int16_t x,
+    int16_t y,
+    uint16_t w,
+    uint16_t h,
+    uint16_t* bitmap
+) {
+    if (!tft) return false;
+    tft->pushImage(x, y, w, h, bitmap);
+    return true;
+}
+
+// ================= SETUP =================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("\n===== ESP32 MJPEG STREAM (NO PSRAM) =====");
+    Serial.printf("psramFound(): %s\n", psramFound() ? "YES" : "NO");
+
+    // ---- WiFi ----
+    WiFi.setSleep(false);
+    WiFi.begin(ssid, password);
+
+    Serial.print("Connecting WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+    server.begin();
+    server.setNoDelay(true);
+    Serial.printf("TCP server started @ %d\n", TCP_PORT);
+
+    // ---- Screen ----
+    screen.init(4, 100);
+    tft->initDMA();
+    // tft->setSwapBytes(true);
+    tft->fillScreen(TFT_BLACK);
+
+    // ---- TJpg_Decoder ----
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setSwapBytes(true);
+    TJpgDec.setCallback(tft_output);
+
+    Serial.println("TJpg_Decoder ready");
+}
+bool readBytes(WiFiClient& c, uint8_t* buf, size_t len, uint32_t timeout_ms = 2000) {
+    size_t received = 0;
+    uint32_t start = millis();
+    
+    while (received < len) {
+        if (c.available()) {
+            int n = c.read(buf + received, len - received);
+            if (n > 0) {
+                received += n;
+            } else if (n < 0) {
+                // 读取错误
+                return false;
+            }
+        }
+        
+        // 超时检查
+        if (millis() - start > timeout_ms) {
+            Serial.printf("Timeout: received %u/%u bytes\n", received, len);
+            return false;
+        }
+        
+        // 短暂延时以避免忙等待
+        if (c.available() == 0) {
+            delay(1);
+        }
+    }
+    return true;
+}
+// ESP32接收端
+#define PACKET_MAGIC 0xDEADBEEF
+// ================= LOOP =================
+void loop() {
+
+    // 等客户端连接
+    if (!client || !client.connected()) {
+        client = server.available();
+        if (client) {
+            Serial.println("[TCP] Client connected");
+            frameCount = 0;
+            byteCount  = 0;
+        }
+        delay(5);
+        return;
+    }
+
+    // 没数据就不读
+    if (!client.available()) {
+        delay(1);
+        return;
+    }
+    unsigned long before_read_time = millis();
+        // ---- 1. 读取帧长度 ----
+    uint8_t header[8];  // 魔数4字节 + 长度4字节
+    
+    // 1. 读取包头
+    if (!readBytes(client, header, 8)) return;
+    
+    // 2. 验证魔数
+    uint32_t magic = (header[0] << 24) | (header[1] << 16) | 
+                     (header[2] << 8) | header[3];
+    
+    if (magic != PACKET_MAGIC) {
+        Serial.printf("Invalid magic: 0x%08X\n", magic);
+        // 清理缓冲区中的无效数据
+        while (client.available()) client.read();
+        return;
+    }
+    
+    // 3. 解析长度
+    uint32_t frameLen = (header[4] << 24) | (header[5] << 16) | 
+              (header[6] << 8) | header[7];
+
+    if (frameLen == 0 || frameLen > JPEG_CHUNK_SIZE) {
+        Serial.printf("[ERR] Invalid frame length %u\n", frameLen);
+        // client.stop();
+        // return;
+
+
+    }
+     // 分配缓冲区存储完整JPEG数据
+    uint8_t* jpegData = new uint8_t[frameLen];
+    if (!jpegData) {
+        Serial.println("[ERR] Memory allocation failed");
+        return;
+    }
+    
+    // 读取完整的JPEG数据
+    if (!readBytes(client, jpegData, frameLen)) {
+        delete[] jpegData;
+        return;
+    }
+    
+    // 一次性解码完整JPEG
+    JRESULT result = TJpgDec.drawJpg(0, 0, jpegData, frameLen);
+    
+    delete[] jpegData;
+    
+    if (result == JDR_OK) {
+        frameCount++;
+        if(frameCount % 1000 == 0)
+        Serial.printf("[OK] Frame %lu, size %u\n", frameCount, frameLen);
+    } else {
+        Serial.println("[ERR] Decode failed");
+    }
+}

@@ -1,0 +1,374 @@
+#include <WiFi.h>
+#include "common.h"
+
+// WiFi配置
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiServer tcpServer(8888);
+WiFiClient tcpClient;
+#define TCP_PORT 8888
+
+// 图像参数
+#define IMG_W 240
+#define IMG_H 240
+#define MAX_LINES_PER_PACKET 40   // 减少到6行，平衡速度和稳定性
+#define BUFFER_SIZE (IMG_W * MAX_LINES_PER_PACKET * 2)
+
+// ------------------------- 三缓冲结构 -------------------------
+struct FrameBuffer {
+    uint16_t y_start;
+    uint16_t line_count;
+    uint16_t lines[IMG_W * MAX_LINES_PER_PACKET];
+};
+
+#define NUM_BUFFERS 2
+FrameBuffer frameBuffers[NUM_BUFFERS];
+volatile uint8_t writeBufferIndex = 0;
+volatile uint8_t readBufferIndex = 0;
+volatile uint8_t freeBufferCount = NUM_BUFFERS;
+volatile bool flowControl = false;  // 流量控制标志
+
+// ------------------------- 全局运行数据 -------------------------
+struct ScreenShareAppRunData {
+    uint16_t *displayBufWithDma[2];
+    bool dmaBufferSel;
+    unsigned long frame_count;
+    unsigned long packet_count;
+    unsigned long error_count;
+    SemaphoreHandle_t bufferMutex;
+    QueueHandle_t displayQueue;
+    TaskHandle_t displayTaskHandle;
+    unsigned long last_packet_time;
+    unsigned long last_stats_time;
+};
+static ScreenShareAppRunData *run_data = NULL;
+
+// ------------------------- 初始化数据 -------------------------
+int initdata() {
+    run_data = (ScreenShareAppRunData*)malloc(sizeof(ScreenShareAppRunData));
+    if (!run_data) return -1;
+    memset(run_data, 0, sizeof(ScreenShareAppRunData));
+
+    run_data->displayBufWithDma[0] = (uint16_t*)heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA);
+    run_data->displayBufWithDma[1] = (uint16_t*)heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA);
+    
+    if (!run_data->displayBufWithDma[0] || !run_data->displayBufWithDma[1]) {
+        free(run_data);
+        return -1;
+    }
+
+    run_data->dmaBufferSel = false;
+    run_data->frame_count = 0;
+    run_data->packet_count = 0;
+    run_data->error_count = 0;
+    run_data->last_packet_time = millis();
+    run_data->last_stats_time = millis();
+    
+    // 创建同步对象
+    run_data->bufferMutex = xSemaphoreCreateMutex();
+    run_data->displayQueue = xQueueCreate(10, sizeof(uint8_t));
+    
+    return 0;
+}
+
+// ------------------------- 工具函数 -------------------------
+bool readBytesWithTimeout(WiFiClient &client, uint8_t *buffer, size_t size, uint32_t timeout_ms) {
+    unsigned long startTime = millis();
+    size_t bytesRead = 0;
+    
+    while (bytesRead < size) {
+        if (millis() - startTime > timeout_ms) {
+            return false; // 超时
+        }
+        
+        if (client.available() > 0) {
+            bytesRead += client.read(buffer + bytesRead, size - bytesRead);
+            run_data->last_packet_time = millis(); // 更新最后接收时间
+        }
+        
+        // 小延迟避免忙等待
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+    
+    return true;
+}
+
+// ------------------------- TCP 接收任务 -------------------------
+void tcpReceiverTask(void *parameter) {
+    uint8_t header[6];
+    uint16_t *rxBuffer = (uint16_t*)malloc(BUFFER_SIZE);
+    if (!rxBuffer) {
+        Serial.println("Failed to allocate rxBuffer!");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    while (1) {
+        // 检查WiFi连接
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected, reconnecting...");
+            WiFi.reconnect();
+            delay(1000);
+            continue;
+        }
+        
+        // 等待客户端连接
+        if (!tcpClient || !tcpClient.connected()) {
+            tcpClient = tcpServer.available();
+            if (tcpClient) {
+                Serial.println("TCP client connected!");
+                tcpClient.setTimeout(100);  // 设置100ms超时
+                tcpClient.setNoDelay(true);  // 禁用Nagle算法
+                
+                // 重置状态
+                freeBufferCount = NUM_BUFFERS;
+                writeBufferIndex = 0;
+                readBufferIndex = 0;
+                flowControl = false;
+                run_data->last_packet_time = millis();
+                
+                // 发送流量控制重置命令（可选）
+                // tcpClient.write("READY");
+            } else {
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                continue;
+            }
+        }
+        
+        // 检查连接超时（5秒无数据）
+        if (millis() - run_data->last_packet_time > 5000) {
+            Serial.println("Connection timeout, disconnecting...");
+            tcpClient.stop();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
+        
+        // 检查是否有数据
+        if (tcpClient.available() == 0) {
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+            continue;
+        }
+        
+        // 流量控制：如果缓冲区已满，丢弃一些数据
+        if (freeBufferCount == 0) {
+            flowControl = true;
+            // 快速清空一些数据以避免积压
+            int available = tcpClient.available();
+            if (available > 1000) {  // 如果积压太多数据
+                tcpClient.flush();
+                Serial.println("Buffer full, flushing data...");
+            }
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
+        } else {
+            flowControl = false;
+        }
+        
+        // 读取包头（带超时）
+        if (!readBytesWithTimeout(tcpClient, header, 6, 100)) {
+            Serial.println("Header read timeout");
+            run_data->error_count++;
+            continue;
+        }
+        
+        // 解析包头
+        uint16_t frame_id = (header[0] << 8) | header[1];
+        uint16_t y_start = (header[2] << 8) | header[3];
+        uint16_t line_count = (header[4] << 8) | header[5];
+        
+        // 验证数据
+        if (line_count == 0 || line_count > MAX_LINES_PER_PACKET) {
+            Serial.printf("Invalid line count: %u\n", line_count);
+            run_data->error_count++;
+            continue;
+        }
+        
+        uint32_t expected_size = IMG_W * line_count * 2;
+        
+        // 读取数据（带超时）
+        if (!readBytesWithTimeout(tcpClient, (uint8_t*)rxBuffer, expected_size, 200)) {
+            Serial.println("Data read timeout");
+            run_data->error_count++;
+            tcpClient.stop();  // 数据不完整，断开重连
+            continue;
+        }
+        
+        // 处理数据 - 不进行字节交换（假设发送端已处理好）
+        uint8_t bufIndex = writeBufferIndex;
+        FrameBuffer* f = &frameBuffers[bufIndex];
+        f->y_start = y_start;
+        f->line_count = line_count;
+        
+        // 快速拷贝
+        memcpy(f->lines, rxBuffer, expected_size);
+        
+        // 更新缓冲区索引
+        writeBufferIndex = (writeBufferIndex + 1) % NUM_BUFFERS;
+        freeBufferCount--;
+        
+        // 发送到显示队列
+        uint8_t notification = bufIndex;
+        if (xQueueSend(run_data->displayQueue, &notification, 0) != pdTRUE) {
+            // 队列满，丢弃最旧的数据
+            uint8_t dummy;
+            xQueueReceive(run_data->displayQueue, &dummy, 0);
+            xQueueSend(run_data->displayQueue, &notification, 0);
+        }
+        
+        run_data->packet_count++;
+        
+        // 喂狗
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+    
+    free(rxBuffer);
+}
+
+// ------------------------- 显示任务 -------------------------
+void displayTask(void *parameter) {
+    uint8_t bufIndex;
+    
+    while (1) {
+        // 等待显示数据
+        if (xQueueReceive(run_data->displayQueue, &bufIndex, portMAX_DELAY) == pdTRUE) {
+            FrameBuffer* f = &frameBuffers[bufIndex];
+            uint16_t* dmaBuf = run_data->displayBufWithDma[run_data->dmaBufferSel];
+            
+            // 显示图像
+            if (tft) {
+                tft->dmaWait();
+                tft->startWrite();
+                tft->pushImageDMA(
+                    0,
+                    f->y_start,
+                    IMG_W,
+                    f->line_count,
+                    f->lines,
+                    dmaBuf
+                );
+                tft->endWrite();
+                
+                run_data->dmaBufferSel = !run_data->dmaBufferSel;
+                run_data->frame_count++;
+            }
+            
+            // 释放缓冲区
+            freeBufferCount++;
+        }
+    }
+}
+
+// ------------------------- Arduino setup -------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(1000);  // 等待串口稳定
+    
+    Serial.println("\n\nStarting screen sharing with TCP...");
+    // 配置WiFi
+    WiFi.setSleep(false);  // 禁用WiFi休眠
+    WiFi.begin(ssid, password);
+    
+    Serial.print("Connecting to WiFi");
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+        delay(500);
+        Serial.print(".");
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nWiFi connection failed!");
+        ESP.restart();
+    }
+    
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    
+    // 设置WiFi功率
+    // esp_wifi_set_max_tx_power(84);  // 20.5dBm
+
+    // 初始化数据
+    if (initdata() != 0) {
+        Serial.println("Failed to initialize data!");
+        while(1);
+    }
+
+    // 启动TCP服务器
+    tcpServer.begin();
+    tcpServer.setNoDelay(true);
+    Serial.printf("TCP server started on port %d\n", TCP_PORT);
+
+    // 初始化屏幕
+    // esp_task_wdt_init(15, true);  // 15秒看门狗
+    // esp_task_wdt_add(NULL);
+    
+    screen.init(4, 100);
+    tft->initDMA();
+    tft->setSwapBytes(true);  // 设置为true，让库处理字节交换
+    
+    // 设置屏幕方向（根据实际需要调整）
+    // tft->setRotation(0);
+    
+    tft->fillScreen(TFT_BLACK);
+    Serial.println("Screen initialized!");
+
+    // 创建显示任务
+    xTaskCreatePinnedToCore(
+        displayTask,
+        "Display Task",
+        4096,
+        NULL,
+        2,    // 优先级2
+        &run_data->displayTaskHandle,
+        1     // 核心1
+    );
+
+    // 创建TCP接收任务
+    xTaskCreatePinnedToCore(
+        tcpReceiverTask,
+        "TCP Receiver",
+        12288,  // 增加栈大小
+        NULL,
+        3,    // 优先级3（高于显示任务）
+        NULL,
+        0     // 核心0
+    );
+    
+    Serial.println("Tasks created successfully!");
+}
+
+// ------------------------- Arduino loop -------------------------
+void loop() {
+    // 喂狗
+    // esp_task_wdt_reset();
+    
+    // 处理屏幕常规任务
+    // if (screen.routine) {
+    //     screen.routine();
+    // }
+    
+    // 每秒统计
+    static unsigned long lastStatsTime = 0;
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastStatsTime >= 2000) {
+        lastStatsTime = currentTime;
+        
+        unsigned long packets = run_data->packet_count;
+        run_data->packet_count = 0;
+        
+        uint32_t freeHeap = ESP.getFreeHeap();
+        
+        Serial.printf("Stats - FPS: %lu, Packets/sec: %lu, Errors: %lu, Heap: %u, FlowControl: %d\n", 
+                      run_data->frame_count / 2,  // 2秒内的帧数
+                      packets / 2,
+                      run_data->error_count,
+                      freeHeap,
+                      flowControl ? 1 : 0);
+                      
+        run_data->frame_count = 0;
+    }
+    
+    delay(1);
+}

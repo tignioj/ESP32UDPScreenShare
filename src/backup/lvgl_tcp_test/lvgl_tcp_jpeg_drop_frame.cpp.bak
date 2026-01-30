@@ -1,0 +1,268 @@
+#include <WiFi.h>
+#include <TJpg_Decoder.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+#define TCP_PORT 8888
+
+WiFiServer server(TCP_PORT);
+WiFiClient client;
+
+// ================= JPEG 帧处理 =================
+#define MAX_FRAME_SIZE (30 * 1024)  // 最大30KB的JPEG帧
+static uint8_t* jpegBuffer = NULL;
+static uint32_t jpegSize = 0;
+static bool receivingFrame = false;
+static uint32_t bytesReceived = 0;
+static uint32_t frameCount = 0;
+static uint32_t totalBytes = 0;
+
+// ================= TJpg callback =================
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    if (!tft) return false;
+    tft->pushImage(x, y, w, h, bitmap);
+    return true;
+}
+
+// ================= 调试函数 =================
+void printMemoryInfo() {
+    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Max alloc heap: %d bytes\n", ESP.getMaxAllocHeap());
+    Serial.printf("PSRAM: %d bytes\n", ESP.getFreePsram());
+}
+
+// ================= SETUP =================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println("\n===== ESP32 MJPEG STREAM RECEIVER =====");
+    Serial.printf("ESP32 Chip ID: %08X\n", ESP.getEfuseMac());
+    Serial.printf("PSRAM Found: %s\n", psramFound() ? "YES" : "NO");
+    
+    // ---- 初始化屏幕 ----
+    screen.init(4, 100);
+    tft->initDMA();
+    // tft->setSwapBytes(true);
+    // tft->setRotation(0);  // 0-3 根据屏幕方向调整
+    tft->fillScreen(TFT_BLACK);
+    
+    // 显示启动信息
+    tft->setTextColor(TFT_WHITE, TFT_BLACK);
+    tft->setTextSize(1);
+    tft->setCursor(10, 10);
+    Serial.println("MJPEG Stream Receiver");
+    tft->setCursor(10, 30);
+    Serial.println("Connecting WiFi...");
+    
+    // ---- WiFi连接 ----
+    WiFi.setSleep(WIFI_PS_NONE);  // 禁用WiFi休眠
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);  // 最大发射功率
+    
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+    
+    int attempt = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        attempt++;
+        if (attempt > 40) {  // 20秒超时
+            Serial.println("\nWiFi连接失败！");
+            tft->fillScreen(TFT_RED);
+            tft->setCursor(10, 50);
+            Serial.println("WiFi连接失败");
+            tft->setCursor(10, 70);
+            Serial.println("请检查配置");
+            while(1) delay(1000);
+        }
+    }
+    
+    Serial.println("\nWiFi连接成功！");
+    Serial.print("IP地址: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("信号强度: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    
+    // 显示连接信息
+    tft->fillScreen(TFT_BLACK);
+    tft->setCursor(10, 10);
+    Serial.println("WiFi连接成功");
+    tft->setCursor(10, 30);
+    Serial.printf("IP: %s", WiFi.localIP().toString().c_str());
+    tft->setCursor(10, 50);
+    Serial.printf("RSSI: %d dBm", WiFi.RSSI());
+    tft->setCursor(10, 70);
+    Serial.println("等待客户端连接...");
+    
+    // ---- 启动TCP服务器 ----
+    server.begin();
+    server.setNoDelay(true);
+    Serial.printf("TCP服务器已启动，端口: %d\n", TCP_PORT);
+    
+    // ---- 初始化JPEG解码器 ----
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setSwapBytes(true);
+    TJpgDec.setCallback(tft_output);
+    
+    Serial.println("JPEG解码器初始化完成");
+    printMemoryInfo();
+    
+    delay(1000);
+}
+
+// ================= LOOP =================
+void loop() {
+    // 1. 检查客户端连接
+    if (!client || !client.connected()) {
+        if (client) {
+            Serial.println("客户端断开连接");
+            client.stop();
+        }
+        
+        client = server.available();
+        if (client) {
+            Serial.println("新的客户端连接");
+            client.setNoDelay(true);  // 禁用Nagle算法
+            client.setTimeout(10);    // 设置读取超时
+            receivingFrame = false;
+            bytesReceived = 0;
+            
+            // 显示连接状态
+            tft->fillScreen(TFT_BLACK);
+            tft->setCursor(10, 10);
+            Serial.println("客户端已连接");
+            tft->setCursor(10, 30);
+            Serial.println("等待数据流...");
+            
+            // 如果有旧的缓冲区，释放它
+            if (jpegBuffer) {
+                free(jpegBuffer);
+                jpegBuffer = NULL;
+            }
+        }
+        delay(50);
+        return;
+    }
+    
+    // 2. 检查是否有数据可用
+    if (!client.available()) {
+        delay(1);
+        return;
+    }
+    
+    // 3. 处理数据接收
+    if (!receivingFrame) {
+        // 手动检查JPEG起始标记 (0xFF, 0xD8)
+        // 先预读第一个字节
+        int firstByte = client.peek();
+        if (firstByte == 0xFF) {
+            // 读取第一个字节确认
+            uint8_t marker[2];
+            marker[0] = client.read();
+            
+            // 尝试读取第二个字节
+            if (client.available() > 0) {
+                marker[1] = client.read();
+                
+                if (marker[1] == 0xD8) {
+                    // 找到起始标记，开始接收帧
+                    receivingFrame = true;
+                    bytesReceived = 0;
+                    jpegSize = 0;
+                    
+                    // 分配缓冲区
+                    if (!jpegBuffer) {
+                        jpegBuffer = (uint8_t*)malloc(MAX_FRAME_SIZE);
+                        if (!jpegBuffer) {
+                            Serial.println("内存分配失败！");
+                            receivingFrame = false;
+                            return;
+                        }
+                    }
+                    
+                    // 保存起始标记
+                    jpegBuffer[0] = marker[0];
+                    jpegBuffer[1] = marker[1];
+                    bytesReceived = 2;
+                    
+                    Serial.println("检测到JPEG起始标记，开始接收帧...");
+                } else {
+                    // 不是JPEG起始标记，放回缓冲区
+                    // 这里我们无法放回，只能继续处理
+                    Serial.println("无效的JPEG起始标记");
+                }
+            } else {
+                // 只有一个字节可用，放回缓冲区等待更多数据
+                // 实际无法放回，这里我们记录错误
+                Serial.println("数据不完整，等待更多数据");
+            }
+        } else if (firstByte != -1) {
+            // 丢弃无效数据
+            client.read();
+            Serial.println("丢弃无效字节");
+        }
+    }
+    
+    // 4. 接收帧数据
+    if (receivingFrame && jpegBuffer) {
+        // 读取可用数据
+        int available = client.available();
+        if (available > 0) {
+            int toRead = min(available, (int)(MAX_FRAME_SIZE - bytesReceived));
+            if (toRead > 0) {
+                int n = client.read(jpegBuffer + bytesReceived, toRead);
+                if (n > 0) {
+                    bytesReceived += n;
+                    totalBytes += n;
+                    
+                    // 检查是否收到结束标记 (0xFF, 0xD9)
+                    if (bytesReceived >= 2) {
+                        if (jpegBuffer[bytesReceived-2] == 0xFF && 
+                            jpegBuffer[bytesReceived-1] == 0xD9) {
+                            // 完整的JPEG帧接收完成
+                            jpegSize = bytesReceived;
+                            receivingFrame = false;
+                            
+                            // 解码JPEG
+                            Serial.printf("解码帧 %lu, 大小: %d bytes\n", 
+                                        frameCount+1, jpegSize);
+                            
+                            // 解码图像
+                            TJpgDec.drawJpg(0, 0, jpegBuffer, jpegSize);
+                            frameCount++;
+                            
+                            // 每10帧打印一次统计信息
+                            if (frameCount % 10 == 0) {
+                                Serial.printf("已解码 %lu 帧，总字节数: %lu\n", 
+                                            frameCount, totalBytes);
+                                printMemoryInfo();
+                            }
+                            
+                            // 重置接收状态
+                            bytesReceived = 0;
+                        }
+                    }
+                    
+                    // 检查缓冲区是否溢出
+                    if (bytesReceived >= MAX_FRAME_SIZE) {
+                        Serial.println("帧大小超过限制，丢弃帧");
+                        receivingFrame = false;
+                        bytesReceived = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ================= 辅助函数（可选） =================
+void clearScreenWithMessage(const char* message) {
+    tft->fillScreen(TFT_BLACK);
+    tft->setCursor(10, 50);
+    Serial.println(message);
+}
