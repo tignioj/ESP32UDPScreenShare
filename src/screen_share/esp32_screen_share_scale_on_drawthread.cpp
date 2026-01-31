@@ -12,7 +12,8 @@ WiFiUDP udp;
 
 // ================= Image =================
 #define IMG_W 240
-#define FRAME_BUF_COUNT 16
+#define FRAME_BUF_COUNT 6 // 主要用来接收udp包的缓冲
+#define MAX_DMA_LINECOUNT 12  // DMA缓冲区大小 要求发送端发送的行数放大后不得超过MAX_DMA_LINECOUNT否则会报错重启
 
 // ================= Frame Buffer =================
 enum BufState {
@@ -23,6 +24,7 @@ enum BufState {
 };
 
 struct FrameData {
+    uint16_t frame_id;
     uint16_t src_y0;
     uint8_t  src_w;
     uint8_t  src_lines;
@@ -61,15 +63,15 @@ void udpReceiverTask(void* param)
             udp.flush();
             continue;
         }
-
+        uint16_t frame_id = (header[0] << 8) | header[1];
         uint16_t src_y0 = (header[2] << 8) | header[3];
-        uint8_t flags   = header[4];
+        uint8_t  flags   = header[4];
 
         uint8_t resolution = (flags >> 6) & 0x03;
         uint8_t color_mode = (flags >> 4) & 0x03;
         uint8_t src_lines  = flags & 0x0F;
 
-        if (src_lines == 0 || src_lines > 8) {
+        if (src_lines == 0 || src_lines > 8) { // 大于8行的直接丢掉
             udp.flush();
             continue;
         }
@@ -88,7 +90,7 @@ void udpReceiverTask(void* param)
         uint32_t bytes_per_px = is_rgb565 ? 2 : 1;
         uint32_t expect = src_w * src_lines * bytes_per_px;
 
-        FrameData* f = nullptr;
+        FrameData* f = nullptr;  
         for (int i = 0; i < FRAME_BUF_COUNT; i++) {
             if (frameBuf[i].state == BUF_FREE) {
                 f = &frameBuf[i];
@@ -97,7 +99,7 @@ void udpReceiverTask(void* param)
             }
         }
 
-        if (!f) {
+        if (!f) { // TODO 缓存满了，要不要考虑覆盖最旧的帧？
             dropCount++;
             udp.flush();
             continue;
@@ -109,6 +111,7 @@ void udpReceiverTask(void* param)
         }
 
         // ===== 只做格式统一，不做 scale =====
+        f->frame_id = frame_id;
         f->src_y0   = src_y0;
         f->src_w    = src_w;
         f->src_lines = src_lines;
@@ -135,22 +138,44 @@ void udpReceiverTask(void* param)
 void drawFrame()
 {
     FrameData* f = nullptr;
+    // 画第一个准备好的
+    // for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+    //     if (frameBuf[i].state == BUF_READY) {
+    //         f = &frameBuf[i];
+    //         break;
+    //     }
+    // }
+    unsigned int min_idx = -1;
+    unsigned int min_val = 0;
+    unsigned long count_time = micros();
     for (int i = 0; i < FRAME_BUF_COUNT; i++) {
         if (frameBuf[i].state == BUF_READY) {
-            f = &frameBuf[i];
-            break;
+            min_idx = i; // 先找到第一个ready的作为比较最小值的根基
+            min_val = frameBuf[i].src_y0 + frameBuf[i].frame_id*2; // 提高id权重
         }
     }
-    if (!f) return;
+    // 所有frame_id最小的之中y_id最小的
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        if (frameBuf[i].state == BUF_READY) {
+
+            if(frameBuf[i].src_y0 + frameBuf[i].frame_id*2 < min_val){
+                min_val = frameBuf[i].src_y0 + frameBuf[i].frame_id*2; // 提高id权重
+                min_idx = i;
+            } 
+        }
+    }
+    if (min_idx==-1) return;
+    f = &frameBuf[min_idx];
+    // Serial.printf("计算耗时%lu\n", micros() - count_time); // 4us
 
     f->state = BUF_DISPLAYING;
     uint8_t nextDma = dmaSel ^ 1;
-
-    tft->dmaWait();
+    tft->dmaWait(); // 这个最多1微秒
 
     int draw_y0 = 0;
     int draw_lines = 0;
 
+    // unsigned long start_convert_time = micros();
     // ================= 240 =================
     if (f->src_w == 240) {
         if(f->is_rgb565){
@@ -191,6 +216,14 @@ void drawFrame()
         draw_y0 = f->src_y0 * 2;
         draw_lines = f->src_lines * 2;
     }
+    // TODO 颜色转换放到UDP线程
+    // Serial.printf("转换花费微秒:%d \n", micros() - start_convert_time);
+    // 实测耗费时间: 
+    // 240低彩223, 高彩9
+    // 180低彩:630， 高彩90
+    // 120低彩187， 高彩52
+    // 可见颜色转换就废了不少时间。
+    // unsigned long start_draw_time = micros();
 
     tft->startWrite();
     tft->pushImageDMA(
@@ -201,7 +234,28 @@ void drawFrame()
         dmaBuf[nextDma]
     );
     tft->endWrite();
+    // Serial.printf("绘制花费间%d\n", micros() - start_draw_time);
+    // 绘制耗时统计
+    // 240-3行 388us
+    // 240-6行 700us
+    // 180-4(会放大到6) 700us
+    // 180-8(会放大到12) 1235 
+    // 120-6(会放大到12) 1340
+    // 120-8(会放大到16) 1770
+    // 120-10(会放大到20) 2190
+    // 120-12(会放大到24) 2615
 
+    // 统计总耗时
+    // item    放大/复制/转换色彩 绘制 多少次满一帧    总计(微秒)
+    // 240高彩:         9           9   240/3=80    80*18=     1440
+    // 240低彩:        223         388  240/6=40    40*611=    24440
+    // 180高彩:         90         700  180/4=45    45*790=    35550
+    // 180低彩:        630        1235  180/8=22.5  22.5*1865= 41962.5  
+    // 120高彩:        53         1340  120/6=20    20*1395=   27900
+    // 120低彩:        187        1340  120/6=20    20*1527=   30540
+    // 120低彩:        187        1770  120/8=15    15*1957=   29355
+    // 120低彩:        187        2190  120/10=12   12*2337=   28524
+    // 120低彩:        187        2615  120/12=10   10*15527=  28020
     dmaSel = nextDma;
     f->state = BUF_FREE;
     frameCount++;
@@ -215,18 +269,19 @@ void initdata()
     frameBuf = (FrameData*)calloc(FRAME_BUF_COUNT, sizeof(FrameData));
     for (int i = 0; i < FRAME_BUF_COUNT; i++) {
         frameBuf[i].lines = (uint16_t*)heap_caps_malloc(
-            1460,
+            1460, // 这个大小主要是MTU单元大小
             MALLOC_CAP_8BIT
         );
         frameBuf[i].state = BUF_FREE;
     }
 
     dmaBuf[0] = (uint16_t*)heap_caps_malloc(
-        IMG_W * 16 * 2,
+        //要求发送端发送的行数放大后不得超过MAX_DMA_LINECOUNT否则会报错重启
+        IMG_W * MAX_DMA_LINECOUNT * 2,  
         MALLOC_CAP_DMA
     );
     dmaBuf[1] = (uint16_t*)heap_caps_malloc(
-        IMG_W * 16 * 2,
+        IMG_W * MAX_DMA_LINECOUNT * 2,
         MALLOC_CAP_DMA
     );
 
@@ -255,6 +310,12 @@ void printDebugInfo() {
                 case BUF_DISPLAYING: Serial.print("D"); break;
             }
         }
+        // Serial.print("|");
+        // for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        //     if(frameBuf[i].state == BUF_READY) {
+        //         Serial.printf("%4d,%3d;", frameBuf[i].frame_id, frameBuf[i].src_y0);
+        //     }
+        // }
         Serial.println();
         
         udpPackets = 0;
