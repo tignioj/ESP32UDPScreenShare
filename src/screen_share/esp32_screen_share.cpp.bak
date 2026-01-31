@@ -14,7 +14,7 @@ WiFiUDP udp;
 #define RGB_LINE_BATCH 12  // 需要足够大，因为放大后行数可能增加
 
 // ================= Frame Buffer =================
-#define FRAME_BUF_COUNT 8
+#define FRAME_BUF_COUNT 12
 
 enum BufState {
     BUF_FREE,
@@ -46,7 +46,7 @@ volatile uint32_t udpPackets = 0;
 void udpReceiverTask(void* param)
 {
     // 增大缓冲区以容纳放大后的数据
-    static uint8_t rxBuf[IMG_W * RGB_LINE_BATCH * 2];
+    static uint8_t rxBuf[1460];
 
     while (1) {
         int packetSize = udp.parsePacket();
