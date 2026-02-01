@@ -1,7 +1,9 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include "common.h"
-#include "scale_function.h"
+#include "scale_function2.h"
+
+// 此版本是把颜色转换放到UDP线程(55us),放缩放到drawFrame(20~27ms)里面，最节省内存，不需要考虑FrameBuffer转换后的大小空间。
 
 // ================= WiFi =================
 const char* ssid = WIFI_SSID_STR;
@@ -12,8 +14,8 @@ WiFiUDP udp;
 
 // ================= Image =================
 #define IMG_W 240
-#define FRAME_BUF_COUNT 12
-#define DMA_MAX_LINE 12
+#define FRAME_BUF_COUNT 5
+#define DMA_MAX_LINE 8
 
 // ================= Frame Buffer =================
 enum BufState {
@@ -117,13 +119,20 @@ void udpReceiverTask(void* param)
 
         uint16_t* dst = f->lines;
         
-
+        // unsigned long start_transfer_time = micros();
         if (src_is_rgb565) {
             memcpy(dst, rxBuf, src_w * src_lines * 2);
         } else {
             uint8_t* src = rxBuf;
             uint16_t* d = dst;
             int n = src_w * src_lines;
+
+            
+            // uint8_t* src = rxBuf;
+            // int px = src_w * src_lines;
+            // for (int i = 0; i < px; i++) {
+            //     dst[i] = rgb332_to_565_lut[src[i]];
+            // }
 
             // 指针展开+查表法，代码变得更加难懂了，此处目的是为了加快rgb332->rgb565的速度。
             // 效果立竿见影，从180us->55+us
@@ -140,7 +149,7 @@ void udpReceiverTask(void* param)
                 *d++ = rgb332_to_565_lut[*src++];
             }
         }
-
+        // Serial.printf("转换颜色耗时:%d\n", micros() - start_transfer_time);
         f->state = BUF_READY;
     }
 }
@@ -174,20 +183,18 @@ void drawFrame()
         draw_lines = f->src_lines;
     }
     else if (f->src_w == 180) {
-        scale_180_to_240_table(
-             (uint8_t*)f->lines,
+        scale_180_to_240_rgb565(
+            f->lines,
             dmaBuf[nextDma],
-            true,
             f->src_lines
         );
         draw_y0 = (f->src_y0 * 240 + 120) / 180;
         draw_lines = (f->src_lines * 240 + 179) / 180;
     }
     else if (f->src_w == 120) {
-        scale_120_to_240(
-             (uint8_t*)f->lines,
+        scale_120_to_240_rgb565(
+            f->lines,
             dmaBuf[nextDma],
-            true,
             f->src_lines
         );
         draw_y0 = f->src_y0 * 2;
@@ -195,9 +202,9 @@ void drawFrame()
     }
     // Serial.printf("转换耗时%lu\n", micros()- start_convert_time);
     // 分 高  低
-    //240 5   9
-    //180 65  82(6行) 112(8行)
-    //120 17  17
+    //240 5   10
+    //180 15  20(6行) 27(8行)
+    //120 22  22
     tft->startWrite();
     tft->pushImageDMA(0, draw_y0, IMG_W, draw_lines, dmaBuf[nextDma]);
     tft->endWrite();

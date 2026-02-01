@@ -83,60 +83,100 @@ void init_scale_maps() {
 }
 // 最近邻插值放大 180→240 (放大系数 1.333:1)
 // 使用映射表的缩放函数
-static void scale_180_to_240_table(const uint8_t* src, uint16_t* dst, bool is_rgb565, int src_lines)
-{
-    // 计算目标行数
+static void scale_180_to_240_rgb565(
+    const uint16_t* src,
+    uint16_t* dst,
+    int src_lines
+) {
     int dst_lines = (src_lines * 240 + 179) / 180;
-    
+
     for (int dst_y = 0; dst_y < dst_lines; dst_y++) {
-        // 使用预计算的映射表
         int src_y = scale_y_map[dst_y];
-        
-        // 确保不越界
-        if (src_y >= src_lines) {
-            src_y = src_lines - 1;
-        }
-        
-        for (int dst_x = 0; dst_x < 240; dst_x++) {
-            int src_x = scale_x_map[dst_x];
-            
-            if (is_rgb565) {
-                dst[dst_y * 240 + dst_x] = ((uint16_t*)src)[src_y * 180 + src_x];
-            } else {
-                dst[dst_y * 240 + dst_x] = rgb332_to_565_lut[src[src_y * 180 + src_x]];
-            }
+        if (src_y >= src_lines) src_y = src_lines - 1;
+
+        const uint16_t* s = src + src_y * 180;
+        uint16_t* d = dst + dst_y * 240;
+
+        for (int x = 0; x < 180; x += 3) {
+            uint16_t p0 = s[x + 0];
+            uint16_t p1 = s[x + 1];
+            uint16_t p2 = s[x + 2];
+
+            *d++ = p0;
+            *d++ = p0;
+            *d++ = p1;
+            *d++ = p2;
         }
     }
 }
+
+static void scale_180_to_240_rgb332(
+    const uint8_t* src,
+    uint16_t* dst,
+    int src_lines
+) {
+    int dst_lines = (src_lines * 240 + 179) / 180;
+
+    for (int dst_y = 0; dst_y < dst_lines; dst_y++) {
+        int src_y = scale_y_map[dst_y];
+        if (src_y >= src_lines) src_y = src_lines - 1;
+
+        const uint8_t* s = src + src_y * 180;
+        uint16_t* d = dst + dst_y * 240;
+
+        for (int x = 0; x < 180; x += 3) {
+            uint16_t p0 = rgb332_to_565_lut[s[x + 0]];
+            uint16_t p1 = rgb332_to_565_lut[s[x + 1]];
+            uint16_t p2 = rgb332_to_565_lut[s[x + 2]];
+
+            *d++ = p0;
+            *d++ = p0;
+            *d++ = p1;
+            *d++ = p2;
+        }
+    }
+}
+
+
 // 最近邻插值放大 120→240 (放大系数 2:1)
-static void scale_120_to_240(const uint8_t* src, uint16_t* dst, bool is_rgb565, int src_lines)
-{
+static void scale_120_to_240_rgb565(
+    const uint16_t* src,
+    uint16_t* dst,
+    int src_lines
+) {
+    for (int y = 0; y < src_lines; y++) {
+        const uint16_t* s = src + y * 120;
+        uint16_t* d0 = dst + (y * 2) * 240;
+        uint16_t* d1 = d0 + 240;
 
-    // 目标行数 = 源行数 * 2
-    int dst_lines = src_lines * 2;
-    // 简单复制: 每个源像素变成 2x2 个目标像素
-    for (int src_y = 0; src_y < src_lines; src_y++) {
-        int dst_y = src_y * 2;
-
-        // 确保不超出目标缓冲区
-        if (dst_y + 1 >= dst_lines) continue;
-        for (int src_x = 0; src_x < 120; src_x++) {
-            int dst_x = src_x * 2;
-            
-            uint16_t pixel;
-            if (is_rgb565) {
-                pixel = ((uint16_t*)src)[src_y * 120 + src_x];
-            } else {
-                pixel = rgb332_to_565_lut[src[src_y * 120 + src_x]];
-            }
-            
-            // 填充 2x2 像素块
-            dst[dst_y * 240 + dst_x] = pixel;
-            dst[dst_y * 240 + dst_x + 1] = pixel;
-            dst[(dst_y + 1) * 240 + dst_x] = pixel;
-            dst[(dst_y + 1) * 240 + dst_x + 1] = pixel;
+        for (int x = 0; x < 120; x++) {
+            uint16_t p = s[x];
+            d0[x * 2]     = p;
+            d0[x * 2 + 1] = p;
+            d1[x * 2]     = p;
+            d1[x * 2 + 1] = p;
         }
     }
 }
+static void scale_120_to_240_rgb332(
+    const uint8_t* src,
+    uint16_t* dst,
+    int src_lines
+) {
+    for (int y = 0; y < src_lines; y++) {
+        const uint8_t* s = src + y * 120;
+        uint16_t* d0 = dst + (y * 2) * 240;
+        uint16_t* d1 = d0 + 240;
+
+        for (int x = 0; x < 120; x++) {
+            uint16_t p = rgb332_to_565_lut[s[x]];
+            d0[x * 2]     = p;
+            d0[x * 2 + 1] = p;
+            d1[x * 2]     = p;
+            d1[x * 2 + 1] = p;
+        }
+    }
+}
+
 
 #endif MY_SCALE_FUNCTION_H

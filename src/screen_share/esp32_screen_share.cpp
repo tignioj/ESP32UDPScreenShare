@@ -1,7 +1,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include "common.h"
-#include "scale_function.h"
+#include "scale_function2.h"
 // ================= WiFi =================
 const char* ssid = WIFI_SSID_STR;
 const char* password = WIFI_PASSWORD_STR;
@@ -11,10 +11,10 @@ WiFiUDP udp;
 // ================= Image =================
 #define IMG_W 240
 
-#define RGB_LINE_BATCH 12  // 需要足够大，因为放大后行数可能增加
+#define RGB_LINE_BATCH 8  // 需要足够大，因为放大后行数可能增加
 
 // ================= Frame Buffer =================
-#define FRAME_BUF_COUNT 8
+#define FRAME_BUF_COUNT 5
 
 enum BufState {
     BUF_FREE,
@@ -26,12 +26,11 @@ enum BufState {
 struct FrameData {
     uint16_t y_start;
     uint16_t line_count;
-    // uint16_t lines[IMG_W * RGB_LINE_BATCH]; // 改位动态分配
-    uint16_t *lines;
+    uint16_t lines[IMG_W * RGB_LINE_BATCH];
     volatile BufState state;
 };
 
-FrameData *frameBuf = nullptr; //[FRAME_BUF_COUNT];
+FrameData frameBuf[FRAME_BUF_COUNT];
 
 // ================= DMA =================
 uint16_t* dmaBuf[2];
@@ -47,12 +46,8 @@ volatile uint32_t udpPackets = 0;
 void udpReceiverTask(void* param)
 {
     // 增大缓冲区以容纳放大后的数据
-    // static uint8_t rxBuf[IMG_W * RGB_LINE_BATCH * 2];
-    uint8_t* rxBuf = (uint8_t*)malloc(IMG_W * RGB_LINE_BATCH * 2);
-    if (!rxBuf) {
-        Serial.println("rxBuf alloc failed");
-        vTaskDelete(NULL);
-    }
+    static uint8_t rxBuf[1460];
+
     while (1) {
         int packetSize = udp.parsePacket();
         if (packetSize <= 0) {
@@ -122,7 +117,6 @@ void udpReceiverTask(void* param)
         // =================================================
         //            分辨率统一 → 240 RGB565
         // =================================================
-        
         uint16_t* dst = f->lines;
         int dst_y0 = 0;
         int dst_lines = 0;
@@ -135,9 +129,20 @@ void udpReceiverTask(void* param)
             if (is_rgb565) {
                 memcpy(dst, rxBuf, 240 * src_lines * 2);
             } else {
-                uint32_t px = 240 * src_lines;
-                for (uint32_t i = 0; i < px; i++) {
-                    dst[i] = rgb332_to_rgb565(rxBuf[i]);
+                int n = src_w * src_lines;
+                uint16_t* d = dst;
+                uint8_t* src = rxBuf;
+                while (n >= 4) {
+                    d[0] = rgb332_to_565_lut[src[0]];
+                    d[1] = rgb332_to_565_lut[src[1]];
+                    d[2] = rgb332_to_565_lut[src[2]];
+                    d[3] = rgb332_to_565_lut[src[3]];
+                    src += 4;
+                    d   += 4;
+                    n   -= 4;
+                }   
+                while (n--) {
+                    *d++ = rgb332_to_565_lut[*src++];
                 }
             }
         }
@@ -146,17 +151,25 @@ void udpReceiverTask(void* param)
             // 计算目标行范围
             dst_y0 = (src_y0 * 240 + 120) / 180;  // 四舍五入
             dst_lines = (src_lines * 240 + 179) / 180; // 向上取整
-            
-
-            
             // 检查缓冲区是否足够
             if (dst_lines > RGB_LINE_BATCH) {
                 f->state = BUF_FREE;
                 udp.flush();
                 continue;
             }
-            
-            scale_180_to_240_table(rxBuf, dst, is_rgb565, src_lines);
+            if (is_rgb565) {
+                scale_180_to_240_rgb565(
+                     (uint16_t*) rxBuf,
+                    dst,
+                    src_lines
+                );
+            } else {
+                scale_180_to_240_rgb332(
+                    rxBuf,
+                    dst,
+                    src_lines
+                );
+            }
         }
         // =============== 120 → 240 ======================
         else if (src_w == 120) {
@@ -168,18 +181,28 @@ void udpReceiverTask(void* param)
                 dst_lines = 240 - dst_y0;
             }
 
-        // 检查缓冲区是否足够
-        // 检查缓冲区是否足够 - 使用动态计算
-        if (dst_lines > RGB_LINE_BATCH) {
-            // 如果超出，调整接收到的行数
-            int max_src_lines = RGB_LINE_BATCH / 2;
-            if (src_lines > max_src_lines) {
-                src_lines = max_src_lines;
-                dst_lines = max_src_lines * 2;
+            // 检查缓冲区是否足够
+            // 检查缓冲区是否足够 - 使用动态计算
+            if (dst_lines > RGB_LINE_BATCH) {
+                // 如果超出，调整接收到的行数
+                int max_src_lines = RGB_LINE_BATCH / 2;
+                if (src_lines > max_src_lines) {
+                    src_lines = max_src_lines;
+                    dst_lines = max_src_lines * 2;
+                }
             }
-        }
-        
-        scale_120_to_240(rxBuf, dst, is_rgb565, src_lines);
+
+            if (is_rgb565) {
+                scale_120_to_240_rgb565((uint16_t*)rxBuf,
+                dst,
+                src_lines);
+            } else {
+                scale_120_to_240_rgb332(
+                    (uint8_t*)rxBuf,
+                    dst,
+                    src_lines);
+            }
+     
         }
 
         // ------------------ 提交 ------------------
@@ -187,9 +210,6 @@ void udpReceiverTask(void* param)
         f->line_count = dst_lines;
         f->state = BUF_READY;
     }
-
-    free(rxBuf);
-    vTaskDelete(NULL);
 }
 
 // ================= Draw Frame =================
@@ -243,45 +263,6 @@ void drawFrame() {
     frameCount++;
 }
 
-
-void initdata() {
-
-    frameBuf = (FrameData*)calloc(FRAME_BUF_COUNT, sizeof(FrameData));
-    if (!frameBuf) {
-        Serial.println("frameBuf alloc failed");
-        while (1);
-    }
-
-    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
-        frameBuf[i].lines = (uint16_t*)heap_caps_malloc(
-            IMG_W * RGB_LINE_BATCH * 2,
-            MALLOC_CAP_8BIT   // ❗不要 DMA，这不是 DMA buffer
-        );
-        if (!frameBuf[i].lines) {
-            Serial.println("frame line alloc failed");
-            while (1);
-        }
-        frameBuf[i].state = BUF_FREE;
-    }
-    init_scale_maps();
-
-    // 分配 DMA 缓冲区
-    dmaBuf[0] = (uint16_t*)heap_caps_malloc(
-        IMG_W * RGB_LINE_BATCH * 2,
-        MALLOC_CAP_DMA
-    );
-    dmaBuf[1] = (uint16_t*)heap_caps_malloc(
-        IMG_W * RGB_LINE_BATCH * 2,
-        MALLOC_CAP_DMA
-    );
-
-    if (!dmaBuf[0] || !dmaBuf[1]) {
-        Serial.println("DMA alloc failed");
-        while (1);
-    }
-
-}
-
 // ================= Setup =================
 void setup() {
     Serial.begin(115200);
@@ -310,7 +291,26 @@ void setup() {
 
     udp.begin(UDP_PORT);
 
-    initdata();
+    for (int i = 0; i < FRAME_BUF_COUNT; i++) {
+        frameBuf[i].state = BUF_FREE;
+    }
+    init_scale_maps();
+
+    // 分配 DMA 缓冲区
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(
+        IMG_W * RGB_LINE_BATCH * 2,
+        MALLOC_CAP_DMA
+    );
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(
+        IMG_W * RGB_LINE_BATCH * 2,
+        MALLOC_CAP_DMA
+    );
+
+    if (!dmaBuf[0] || !dmaBuf[1]) {
+        Serial.println("DMA alloc failed");
+        while (1);
+    }
+
     // 创建 UDP 接收任务
     xTaskCreatePinnedToCore(
         udpReceiverTask,
