@@ -309,10 +309,9 @@ void setup() {
     tft->fillScreen(TFT_BLACK);
     tft->setTextSize(2);
     tft->setTextColor(TFT_WHITE);
-    
     // 显示文字
     tft->println("No network! Please connect to AP:ESP32ScreenShareUDP, then input you 2.4G WiFi and password.");
-    tft->setCursor(0, 4);    // ❗ 不要带第三个参数
+    tft->setCursor(0, 10);    // ❗ 不要带第三个参数
     
     // WiFi.begin(ssid, password);
     // while (WiFi.status() != WL_CONNECTED) {
@@ -358,10 +357,14 @@ void setup() {
     tft->fillScreen(TFT_BLACK);
     String wifi_str = WiFi.localIP().toString() + ":8888";
     tft->println(wifi_str);
-    tft->setCursor(0,54);    // ❗ 不要带第三个参数
+    tft->setCursor(0,34);    // ❗ 不要带第三个参数
     tft->setTextFont(2);      // 明确指定字体
     tft->setTextSize(1);
-    tft->println("ScreenShareUDP client: https://github.com/tignioj/ESP32UDPScreenShareClient");
+    tft->println("ScreenShareUDP v0.0.1, transfer color and scale in udp thread.");
+    tft->setCursor(0,74);    // ❗ 不要带第三个参数
+    tft->println("Client: https://github.com/tignioj/ESP32UDPScreenShareClient");
+
+
 }
 
 // ================= Debug Info =================
