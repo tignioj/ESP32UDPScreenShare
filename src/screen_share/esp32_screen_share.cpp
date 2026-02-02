@@ -2,6 +2,7 @@
 #include <WiFiUdp.h>
 #include "common.h"
 #include "scale_function2.h"
+#include "network_config.h"
 // ================= WiFi =================
 const char* ssid = WIFI_SSID_STR;
 const char* password = WIFI_PASSWORD_STR;
@@ -304,21 +305,21 @@ void setup() {
     tft->setSwapBytes(true);
 
     tft->setTextFont(1);      // 明确指定字体
-    tft->setCursor(0, 4);    // ❗ 不要带第三个参数
     // 清屏并设置文字
     tft->fillScreen(TFT_BLACK);
     tft->setTextSize(2);
     tft->setTextColor(TFT_WHITE);
     
     // 显示文字
-    tft->println("Waiting for WiFi...");
+    tft->println("No network! Please connect to AP:ESP32ScreenShareUDP, then input you 2.4G WiFi and password.");
+    tft->setCursor(0, 4);    // ❗ 不要带第三个参数
     
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(300);
-        Serial.print(".");
-    }
-    tft->fillScreen(TFT_GREEN);
+    // WiFi.begin(ssid, password);
+    // while (WiFi.status() != WL_CONNECTED) {
+    //     delay(300);
+    //     Serial.print(".");
+    // }
+    NetworkConfig::begin();   // ⭐ 一行解决 WiFi / AP / 配网
     Serial.println("\nWiFi connected");
 
     udp.begin(UDP_PORT);
@@ -360,7 +361,7 @@ void setup() {
     tft->setCursor(0,54);    // ❗ 不要带第三个参数
     tft->setTextFont(2);      // 明确指定字体
     tft->setTextSize(1);
-    tft->println("Streaming client: https://github.com/tignioj/ESP32UDPScreenShareClient");
+    tft->println("ScreenShareUDP client: https://github.com/tignioj/ESP32UDPScreenShareClient");
 }
 
 // ================= Debug Info =================
