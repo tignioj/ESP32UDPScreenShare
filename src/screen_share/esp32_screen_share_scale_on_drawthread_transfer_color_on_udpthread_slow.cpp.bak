@@ -1,7 +1,9 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include "common.h"
+// 这个版本用的旧版缩放和颜色转换，所以效率较低，仅作参考
 #include "scale_function1.h"
+
 
 // ================= WiFi =================
 const char* ssid = WIFI_SSID_STR;

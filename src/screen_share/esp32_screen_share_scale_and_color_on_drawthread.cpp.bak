@@ -15,8 +15,8 @@ WiFiUDP udp;
 
 // ================= Image =================
 #define IMG_W 240
-#define FRAME_BUF_COUNT 8 // 主要用来接收udp包的缓冲
-#define MAX_DMA_LINECOUNT 8  // DMA缓冲区大小 要求发送端发送的行数放大后不得超过MAX_DMA_LINECOUNT否则会报错重启
+#define FRAME_BUF_COUNT 12 // 主要用来接收udp包的缓冲
+#define MAX_DMA_LINECOUNT 12  // DMA缓冲区大小 要求发送端发送的行数放大后不得超过MAX_DMA_LINECOUNT否则会报错重启
 
 // ================= Frame Buffer =================
 enum BufState {

@@ -11,10 +11,10 @@ WiFiUDP udp;
 // ================= Image =================
 #define IMG_W 240
 
-#define RGB_LINE_BATCH 8  // 需要足够大，因为放大后行数可能增加
+#define RGB_LINE_BATCH 12  // 需要足够大，因为放大后行数可能增加
 
 // ================= Frame Buffer =================
-#define FRAME_BUF_COUNT 5
+#define FRAME_BUF_COUNT 12
 
 enum BufState {
     BUF_FREE,
@@ -24,6 +24,7 @@ enum BufState {
 };
 
 struct FrameData {
+    uint16_t frame_id;// = (header[0] << 8) | header[1];
     uint16_t y_start;
     uint16_t line_count;
     uint16_t lines[IMG_W * RGB_LINE_BATCH];
@@ -206,6 +207,7 @@ void udpReceiverTask(void* param)
         }
 
         // ------------------ 提交 ------------------
+        f->frame_id = frame_id;
         f->y_start = dst_y0;
         f->line_count = dst_lines;
         f->state = BUF_READY;
@@ -214,28 +216,58 @@ void udpReceiverTask(void* param)
 
 // ================= Draw Frame =================
 void drawFrame() {
-    FrameData* newest = nullptr;
-    int newestIdx = -1;
+    FrameData* f = nullptr;
 
     // 找 READY 的缓冲区
+    // 从左往右找，先绘制最旧到的包。由于udp的无序，新旧差距不算大
     for (int i = 0; i < FRAME_BUF_COUNT; i++) {
         if (frameBuf[i].state == BUF_READY) {
-            newest = &frameBuf[i];
-            newestIdx = i;
+            f = &frameBuf[i];
             break;
         }
     }
+    if (!f) return;
+    // 从右往左找，先绘制最新到的包
+    // for (int i = FRAME_BUF_COUNT-1; i >= 0; i--) {
+    //     if (frameBuf[i].state == BUF_READY) {
+    //         f = &frameBuf[i];
+    //         break;
+    //     }
+    // }
+    // if (!f) return;
 
-    if (!newest) return;
+
+    // unsigned int min_val=0;
+    // unsigned i;
+    // for (i = 0; i < FRAME_BUF_COUNT; i++) {
+    //     if (frameBuf[i].state == BUF_READY) {
+    //         f = &frameBuf[i];
+    //         min_val = f->frame_id;
+    //     }
+    // }
+    // if (!f) return;
+    // for (; i < FRAME_BUF_COUNT; i++) {
+    //     if (frameBuf[i].state == BUF_READY) {
+    //         if(frameBuf[i].frame_id < min_val) {
+    //             min_val = frameBuf[i].frame_id;
+    //             f = &frameBuf[i];
+    //         }
+    //     }
+    // }
+    // if (!f) return;
+
 
     // 其余 READY 的直接丢弃（防堆积）
+    // 实际上不能丢，丢了闪屏更严重
     // for (int i = 0; i < FRAME_BUF_COUNT; i++) {
     //     if (i != newestIdx && frameBuf[i].state == BUF_READY) {
     //         frameBuf[i].state = BUF_FREE;
     //     }
     // }
 
-    newest->state = BUF_DISPLAYING;
+    
+
+    f->state = BUF_DISPLAYING;
 
     uint8_t nextDma = dmaSel ^ 1;
 
@@ -244,22 +276,22 @@ void drawFrame() {
 
     memcpy(
         dmaBuf[nextDma],
-        newest->lines,
-        IMG_W * newest->line_count * 2
+        f->lines,
+        IMG_W * f->line_count * 2
     );
 
     tft->startWrite();
     tft->pushImageDMA(
         0,
-        newest->y_start,
+        f->y_start,
         IMG_W,
-        newest->line_count,
+        f->line_count,
         dmaBuf[nextDma]
     );
     tft->endWrite();
 
     dmaSel = nextDma;
-    newest->state = BUF_FREE;
+    f->state = BUF_FREE;
     frameCount++;
 }
 

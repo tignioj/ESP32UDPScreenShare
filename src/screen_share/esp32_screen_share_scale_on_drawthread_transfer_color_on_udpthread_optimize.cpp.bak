@@ -14,8 +14,8 @@ WiFiUDP udp;
 
 // ================= Image =================
 #define IMG_W 240
-#define FRAME_BUF_COUNT 5
-#define DMA_MAX_LINE 8
+#define FRAME_BUF_COUNT 12
+#define DMA_MAX_LINE 12
 
 // ================= Frame Buffer =================
 enum BufState {
@@ -26,6 +26,7 @@ enum BufState {
 };
 
 struct FrameData {
+    uint16_t frame_id;// = (header[0] << 8) | header[1];
     uint16_t src_y0;
     uint8_t  src_w;
     uint8_t  src_lines;
@@ -59,13 +60,12 @@ void udpReceiverTask(void* param)
             continue;
         }
         udpPackets++;
-
         uint8_t header[5];
         if (udp.read(header, 5) != 5) {
             udp.flush();
             continue;
         }
-
+        uint16_t frame_id = (header[0] << 8) | header[1];
         uint16_t src_y0 = (header[2] << 8) | header[3];
         uint8_t flags   = header[4];
 
@@ -113,6 +113,7 @@ void udpReceiverTask(void* param)
         }
 
         // ===== 统一转为 RGB565 =====
+        f->frame_id = frame_id;
         f->src_y0    = src_y0;
         f->src_w     = src_w;
         f->src_lines = src_lines;
@@ -167,6 +168,25 @@ void drawFrame()
         }
     }
     if (!f) return;
+    // unsigned int min_val=0;
+    // unsigned i;
+    // for (i = 0; i < FRAME_BUF_COUNT; i++) {
+    //     if (frameBuf[i].state == BUF_READY) {
+    //         f = &frameBuf[i];
+    //         min_val = f->frame_id;
+    //     }
+    // }
+    // if (!f) return;
+    // for (; i < FRAME_BUF_COUNT; i++) {
+    //     if (frameBuf[i].state == BUF_READY) {
+    //         if(frameBuf[i].frame_id < min_val) {
+    //             min_val = frameBuf[i].frame_id;
+    //             f = &frameBuf[i];
+    //         }
+    //     }
+    // }
+    // if (!f) return;
+    
 
     f->state = BUF_DISPLAYING;
     uint8_t nextDma = dmaSel ^ 1;
