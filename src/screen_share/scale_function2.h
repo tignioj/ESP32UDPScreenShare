@@ -178,5 +178,4 @@ static void scale_120_to_240_rgb332(
     }
 }
 
-
-#endif MY_SCALE_FUNCTION_H
+#endif

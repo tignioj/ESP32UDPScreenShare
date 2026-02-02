@@ -51,10 +51,11 @@ void setup() {
 
     server.begin();
     server.setNoDelay(true);
+    client.setNoDelay(true);
     Serial.printf("TCP server started @ %d\n", TCP_PORT);
 
     // ---- Screen ----
-    screen.init(4, 100);
+    tft_init();
     tft->initDMA();
     tft->fillScreen(TFT_BLACK);
 
@@ -79,7 +80,8 @@ bool readBytes(WiFiClient& c, uint8_t* buf, size_t len) {
         }
         // 超时 2 秒
         if (millis() - start > 2000) return false;
-        delay(1);
+        // delay(1);
+        // yield();   // 或完全删掉
     }
     return true;
 }
@@ -122,7 +124,9 @@ void loop() {
     // ---- 3. 解码并显示 ----
     if (TJpgDec.drawJpg(0, 0, currBuffer, frameLen)==JDR_OK) {
         frameCount++;
-        Serial.printf("[OK] Frame %lu, bytes %lu\n", frameCount, byteCount);
+        if ((frameCount & 0x1F) == 0) { // 每32帧打印一次
+            Serial.printf("[OK] Frame %lu, bytes %lu\n", frameCount, byteCount);
+        }
         byteCount = 0;
 
         // ---- 4. 双缓冲切换 ----

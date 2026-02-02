@@ -1,0 +1,181 @@
+#include <WiFi.h>
+#include <TJpg_Decoder.h>
+#include "common.h"
+
+// ================= WiFi =================
+const char* ssid     = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+#define TCP_PORT 8888
+
+WiFiServer server(TCP_PORT);
+WiFiClient client;
+
+// ================= JPEG ring buffer =================
+#define MAX_JPEG_SIZE 1024*12
+#define BUF_COUNT 5
+
+static uint8_t  jpegBuf[BUF_COUNT][MAX_JPEG_SIZE];
+static uint32_t jpegLen[BUF_COUNT];
+
+static volatile uint8_t writeIdx = 0;
+static volatile uint8_t readIdx  = 0;
+static volatile uint8_t bufCount = 0;
+
+// ================= Stats =================
+static uint32_t frameCount = 0;
+static uint32_t dropCount  = 0;
+
+// ================= RTOS =================
+TaskHandle_t tcpTaskHandle    = NULL;
+TaskHandle_t decodeTaskHandle = NULL;
+
+// ================= TFT callback =================
+#define LINE_BATCH 16 // 每次 pushImage 的行数
+
+uint16_t lineBuf[240 * LINE_BATCH]; // 假设屏宽 240
+
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    // 分批绘制，等待 DMA 完成
+    for (int offset = 0; offset < h; offset += LINE_BATCH) {
+        int batch = min(LINE_BATCH, h - offset);
+        memcpy(lineBuf, bitmap + offset*w, batch*w*2); // RGB565
+        while(tft->dmaBusy()) vTaskDelay(1);
+        tft->pushImage(x, y + offset, w, batch, lineBuf);
+    }
+    return true;
+}
+
+
+// ================= Helper =================
+bool readBytes(WiFiClient& c, uint8_t* buf, size_t len) {
+    size_t received = 0;
+    unsigned long start = millis();
+
+    while (received < len) {
+        if (c.available()) {
+            int n = c.read(buf + received, len - received);
+            if (n > 0) received += n;
+        }
+        if (millis() - start > 2000) return false;
+        vTaskDelay(1);
+    }
+    return true;
+}
+
+// ================= TCP Producer =================
+void tcpTask(void*) {
+    for (;;) {
+        if (!client || !client.connected()) {
+            client = server.available();
+            if (client) {
+                client.setNoDelay(true);
+                Serial.println("[TCP] Client connected");
+            }
+            vTaskDelay(10);
+            continue;
+        }
+
+        uint8_t lenBuf[4];
+        if (!readBytes(client, lenBuf, 4)) {
+            client.stop();
+            continue;
+        }
+
+        uint32_t frameLen =
+            ((uint32_t)lenBuf[0] << 24) |
+            ((uint32_t)lenBuf[1] << 16) |
+            ((uint32_t)lenBuf[2] << 8)  |
+            ((uint32_t)lenBuf[3]);
+
+        if (frameLen == 0 || frameLen > MAX_JPEG_SIZE) {
+            client.stop();
+            continue;
+        }
+
+        // ring 满 → 丢最旧的一帧
+        if (bufCount == BUF_COUNT) {
+            readIdx = (readIdx + 1) % BUF_COUNT;
+            bufCount--;
+            dropCount++;
+        }
+
+        uint8_t* target = jpegBuf[writeIdx];
+
+        if (!readBytes(client, target, frameLen)) {
+            client.stop();
+            continue;
+        }
+
+        jpegLen[writeIdx] = frameLen;
+
+        writeIdx = (writeIdx + 1) % BUF_COUNT;
+        bufCount++;
+    }
+}
+
+// ================= Decode Consumer =================
+void decodeTask(void*) {
+    for (;;) {
+        if (bufCount == 0) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        uint8_t* srcBuf = jpegBuf[readIdx];
+        uint32_t srcLen = jpegLen[readIdx];
+
+        readIdx = (readIdx + 1) % BUF_COUNT;
+        bufCount--;
+
+        TJpgDec.drawJpg(0, 0, srcBuf, srcLen); // callback 已处理 line buffer + DMA 等待
+
+        frameCount++;
+        if ((frameCount & 0x1F) == 0) {
+            Serial.printf("[OK] Frame %lu, drop %lu, queued %u\n",
+                          frameCount, dropCount, bufCount);
+        }
+    }
+}
+
+// ================= SETUP =================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    WiFi.setSleep(false);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) delay(200);
+
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+    server.begin();
+    server.setNoDelay(true);
+
+    // TFT
+    tft_init();
+    tft->initDMA();
+    tft->fillScreen(TFT_BLACK);
+
+    // JPEG
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setSwapBytes(true);
+    TJpgDec.setCallback(tft_output);
+
+    // Tasks
+    xTaskCreatePinnedToCore(
+        tcpTask, "tcp",
+        4096, NULL, 3,
+        &tcpTaskHandle, 0
+    );
+
+    xTaskCreatePinnedToCore(
+        decodeTask, "decode",
+        8192, NULL, 2,
+        &decodeTaskHandle, 1
+    );
+}
+
+void loop() {
+    vTaskDelay(1000);
+}

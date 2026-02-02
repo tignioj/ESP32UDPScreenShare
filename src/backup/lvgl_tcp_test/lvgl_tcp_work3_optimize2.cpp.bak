@@ -126,8 +126,8 @@ void drawFrame() {
     }
 
     if (!newest) {
-        Serial.println("drawFrame闲置了");
-        delay(2);
+        // delay(2);
+        vTaskDelay(1);
         return;
     }
     
@@ -190,7 +190,7 @@ void setup() {
         frameBuf[i].state = BUF_FREE;
     }
 
-    screen.init(4, 100);
+    tft_init();
     tft->initDMA();
     tft->setSwapBytes(true);
 

@@ -74,7 +74,7 @@ void setup() {
     Serial.printf("TCP server started @ %d\n", TCP_PORT);
 
     // ---- Screen ----
-    screen.init(4, 100);
+    tft_init();
     tft->initDMA();
     tft->setSwapBytes(true);
     tft->fillScreen(TFT_BLACK);

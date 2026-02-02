@@ -303,7 +303,7 @@ void setup() {
     // esp_task_wdt_init(15, true);  // 15秒看门狗
     // esp_task_wdt_add(NULL);
     
-    screen.init(4, 100);
+    tft_init();
     tft->initDMA();
     tft->setSwapBytes(true);  // 设置为true，让库处理字节交换
     
