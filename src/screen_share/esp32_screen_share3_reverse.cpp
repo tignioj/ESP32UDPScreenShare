@@ -264,7 +264,7 @@ void drawTask(void* param) {
 void setup() {
     Serial.begin(115200);
     tft_init();
-    setCpuFrequencyMhz(240); // 发热
+    setCpuFrequencyMhz(160); // 发热
     
     tft->initDMA();
     tft->setSwapBytes(true);
@@ -318,7 +318,7 @@ void setup() {
     tft->setCursor(0, 34);
     tft->setTextFont(2);
     tft->setTextSize(1);
-    tft->println("ScreenShareUDP v0.0.1, UDP in loop, draw in task.");
+    tft->println("ScreenShareUDP v0.0.2, UDP in loop, draw in task.");
     tft->setCursor(0, 74);
     tft->println("Client: https://github.com/tignioj/ESP32UDPScreenShareClient");
 }
@@ -362,7 +362,7 @@ void loop() {
     }
     
     // 显示调试信息
-    printDebugInfo();
+    // printDebugInfo();
     
     // 短暂延时，防止过度占用CPU
     // delay(1);
