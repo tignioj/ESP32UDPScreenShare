@@ -3,7 +3,7 @@
 #include "common.h"
 #include "scale_function2.h"
 #include "network_config.h"
-
+// 本代码是screen share一种实验：把绘制线程放入了core1的xTask,而udp线程放进loop，画面撕裂感大幅度下降，吞吐率1500-1600pac/s
 // ================= WiFi =================
 const char* ssid = WIFI_SSID_STR;
 const char* password = WIFI_PASSWORD_STR;

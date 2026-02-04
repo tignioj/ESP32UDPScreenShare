@@ -1,0 +1,193 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "common.h"
+#include "scale_function2.h"
+#include "network_config.h"
+// 本代码是screen share一种实验：把udp接收任务和绘制任务放在同一个loop，udp吞吐率并未提升，画面撕裂严重。
+
+// ================= WiFi =================
+const char* ssid = WIFI_SSID_STR;
+const char* password = WIFI_PASSWORD_STR;
+
+WiFiUDP udp;
+#define UDP_PORT 8888
+
+// ================= Image =================
+#define IMG_W 240
+#define RGB_LINE_BATCH 12  // 放大后行数可能增加
+
+// ================= DMA =================
+uint16_t* dmaBuf[2];
+volatile uint8_t dmaSel = 0;
+
+// ================= Stats =================
+volatile uint32_t frameCount = 0;
+volatile uint32_t dropCount = 0;
+volatile uint32_t udpPackets = 0;
+
+// ================= Setup =================
+void setup() {
+    Serial.begin(115200);
+    tft_init();
+    setCpuFrequencyMhz(240); // 高性能
+
+    tft->initDMA();
+    tft->setSwapBytes(true);
+
+    tft->setTextFont(1);
+    tft->fillScreen(TFT_BLACK);
+    tft->setTextSize(2);
+    tft->setTextColor(TFT_WHITE);
+    tft->println("No network! Connect to AP:ESP32ScreenShareUDP");
+    tft->setCursor(0, 10);
+
+    NetworkConfig::begin();
+    Serial.println("\nWiFi connected");
+
+    udp.begin(UDP_PORT);
+
+    init_scale_maps();
+
+    dmaBuf[0] = (uint16_t*)heap_caps_malloc(IMG_W * RGB_LINE_BATCH * 2, MALLOC_CAP_DMA);
+    dmaBuf[1] = (uint16_t*)heap_caps_malloc(IMG_W * RGB_LINE_BATCH * 2, MALLOC_CAP_DMA);
+
+    if (!dmaBuf[0] || !dmaBuf[1]) {
+        Serial.println("DMA alloc failed");
+        while (1);
+    }
+
+    tft->fillScreen(TFT_BLACK);
+    String wifi_str = WiFi.localIP().toString() + ":8888";
+    tft->println(wifi_str);
+    tft->setCursor(0,34);
+    tft->setTextFont(2);
+    tft->setTextSize(1);
+    tft->println("ScreenShareUDP v0.0.1, single-core direct draw");
+    tft->setCursor(0,74);
+    tft->println("Client: https://github.com/tignioj/ESP32UDPScreenShareClient");
+}
+// ================= Debug Info =================
+void printDebugInfo() {
+    static uint32_t lastPrint = 0;
+    uint32_t now = millis();
+    
+    if (now - lastPrint > 1000) {
+        lastPrint = now;
+        
+        Serial.printf("内存: %u, ", ESP.getFreeHeap());
+        Serial.printf("UDP包/秒: %u, ", udpPackets);
+        Serial.printf("丢包数: %u, ", dropCount);
+        Serial.printf("显示帧数: %u, ", frameCount);
+        
+        Serial.println();
+        udpPackets = 0;
+    }
+}
+
+// ================= Loop =================
+void loop() {
+    static uint8_t rxBuf[1460];
+    int packetSize = udp.parsePacket();
+    if (packetSize <= 0) {
+        return;
+    }
+    udpPackets++;
+
+    // ------------------ 读 Header ------------------
+    uint8_t header[5];
+    if (udp.read(header, 5) != 5) {
+        udp.flush();
+        return;
+    }
+
+    uint16_t frame_id = (header[0] << 8) | header[1];
+    uint16_t src_y0 = (header[2] << 8) | header[3];
+    uint8_t flags = header[4];
+
+    uint8_t resolution = (flags >> 6) & 0x03; // 0=240,1=180,2=120
+    uint8_t color_mode = (flags >> 4) & 0x03; // 0=RGB565,1=RGB332
+    uint8_t src_lines = flags & 0x0F;
+
+    if (src_lines == 0 || src_lines > RGB_LINE_BATCH) {
+        udp.flush();
+        dropCount++;
+        return;
+    }
+
+    bool is_rgb565 = (color_mode == 0);
+
+    int src_w, src_h;
+    switch (resolution) {
+        case 0: src_w = src_h = 240; break;
+        case 1: src_w = src_h = 180; break;
+        case 2: src_w = src_h = 120; break;
+        default:
+            udp.flush();
+            dropCount++;
+            return;
+    }
+
+    uint32_t bytes_per_px = is_rgb565 ? 2 : 1;
+    uint32_t expect = src_w * src_lines * bytes_per_px;
+
+    if (udp.read(rxBuf, expect) != expect) {
+        dropCount++;
+        return;
+    }
+
+    // ================== 放大到 240 RGB565 ==================
+    uint16_t static dst[IMG_W * RGB_LINE_BATCH];
+    int dst_y0 = 0;
+    int dst_lines = 0;
+
+    if (src_w == 240) {
+        dst_y0 = src_y0;
+        dst_lines = src_lines;
+        if (is_rgb565) {
+            memcpy(dst, rxBuf, 240 * src_lines * 2);
+        } else {
+            for (int i = 0; i < src_w * src_lines; i++) {
+                dst[i] = rgb332_to_565_lut[rxBuf[i]];
+            }
+        }
+    } else if (src_w == 180) {
+        dst_y0 = (src_y0 * 240 + 120) / 180;
+        dst_lines = (src_lines * 240 + 179) / 180;
+        if (dst_lines > RGB_LINE_BATCH) dst_lines = RGB_LINE_BATCH;
+
+        if (is_rgb565) {
+            scale_180_to_240_rgb565((uint16_t*)rxBuf, dst, src_lines);
+        } else {
+            scale_180_to_240_rgb332(rxBuf, dst, src_lines);
+        }
+    } else if (src_w == 120) {
+        dst_y0 = src_y0 * 2;
+        dst_lines = src_lines * 2;
+        if (dst_y0 + dst_lines > 240) dst_lines = 240 - dst_y0;
+        if (dst_lines > RGB_LINE_BATCH) dst_lines = RGB_LINE_BATCH;
+
+        if (is_rgb565) {
+            scale_120_to_240_rgb565((uint16_t*)rxBuf, dst, src_lines);
+        } else {
+            scale_120_to_240_rgb332(rxBuf, dst, src_lines);
+        }
+    }
+
+    // ================== 绘制 ==================
+    uint8_t nextDma = dmaSel ^ 1;
+    tft->dmaWait();
+    memcpy(dmaBuf[nextDma], dst, IMG_W * dst_lines * 2);
+
+    tft->startWrite();
+    tft->pushImageDMA(0, dst_y0, IMG_W, dst_lines, dmaBuf[nextDma]);
+    tft->endWrite();
+
+    dmaSel = nextDma;
+    frameCount++;
+
+    // ================== Debug ==================
+    printDebugInfo();
+
+    // Serial.printf("Frame %u, UDP包/秒:%u, 丢包:%u, 显示帧:%u\n",frame_id, udpPackets, dropCount, frameCount);
+    // udpPackets = 0;
+}
