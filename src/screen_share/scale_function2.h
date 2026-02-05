@@ -5,7 +5,7 @@
 
 
 // ================= RGB332 → RGB565 =================
-static inline uint16_t rgb332_to_rgb565(uint8_t c)
+IRAM_ATTR static inline uint16_t rgb332_to_rgb565(uint8_t c)
 {
     return ((c & 0xE0) << 8) |   // R: 3 → 5
            ((c & 0x1C) << 6) |   // G: 3 → 6
@@ -23,7 +23,7 @@ for i in range(256):
     if (i + 1) % 8 == 0:
         print()
 */
-static const uint16_t rgb332_to_565_lut[256] = {
+DRAM_ATTR static const uint16_t rgb332_to_565_lut[256] = {
 0x0000,0x0008,0x0010,0x0018,0x0100,0x0108,0x0110,0x0118,
 0x0200,0x0208,0x0210,0x0218,0x0300,0x0308,0x0310,0x0318,
 0x0400,0x0408,0x0410,0x0418,0x0500,0x0508,0x0510,0x0518,
@@ -61,8 +61,8 @@ static const uint16_t rgb332_to_565_lut[256] = {
 // ================= 放大函数 =================
 
 // 预计算映射表
-static int scale_x_map[240];  // 水平映射表
-static int scale_y_map[240];  // 垂直映射表（最大支持240行）
+DRAM_ATTR static int scale_x_map[240];  // 水平映射表
+DRAM_ATTR static int scale_y_map[240];  // 垂直映射表（最大支持240行）
 // 初始化映射表（在setup中调用）
 void init_scale_maps() {
     // 计算水平映射
@@ -83,7 +83,7 @@ void init_scale_maps() {
 }
 // 最近邻插值放大 180→240 (放大系数 1.333:1)
 // 使用映射表的缩放函数
-static void scale_180_to_240_rgb565(
+IRAM_ATTR  static void scale_180_to_240_rgb565(
     const uint16_t* src,
     uint16_t* dst,
     int src_lines
@@ -110,7 +110,7 @@ static void scale_180_to_240_rgb565(
     }
 }
 
-static void scale_180_to_240_rgb332(
+IRAM_ATTR static void scale_180_to_240_rgb332(
     const uint8_t* src,
     uint16_t* dst,
     int src_lines
@@ -139,7 +139,7 @@ static void scale_180_to_240_rgb332(
 
 
 // 最近邻插值放大 120→240 (放大系数 2:1)
-static void scale_120_to_240_rgb565(
+IRAM_ATTR static void scale_120_to_240_rgb565(
     const uint16_t* src,
     uint16_t* dst,
     int src_lines
@@ -158,7 +158,7 @@ static void scale_120_to_240_rgb565(
         }
     }
 }
-static void scale_120_to_240_rgb332(
+IRAM_ATTR static void scale_120_to_240_rgb332(
     const uint8_t* src,
     uint16_t* dst,
     int src_lines

@@ -13,10 +13,10 @@ WiFiUDP udp;
 
 // ================= Image =================
 #define IMG_W 240
-#define RGB_LINE_BATCH 12  // 需要足够大，因为放大后行数可能增加
+#define RGB_LINE_BATCH 8  // 需要足够大，因为放大后行数可能增加
 
 // ================= Frame Buffer =================
-#define FRAME_BUF_COUNT 12
+#define FRAME_BUF_COUNT 12 // 214492
 
 enum BufState {
     BUF_FREE,
@@ -45,7 +45,7 @@ volatile uint32_t dropCount = 0;
 volatile uint32_t udpPackets = 0;
 
 // ================= UDP Receiver Function =================
-bool processUDPPacket() {
+IRAM_ATTR  bool processUDPPacket() {
     static uint8_t rxBuf[1460];
     
     int packetSize = udp.parsePacket();
@@ -211,7 +211,7 @@ bool processUDPPacket() {
 }
 
 // ================= Draw Task =================
-void drawTask(void* param) {
+IRAM_ATTR void drawTask(void* param) {
     while (1) {
         FrameData* f = nullptr;
 
@@ -264,7 +264,7 @@ void drawTask(void* param) {
 void setup() {
     Serial.begin(115200);
     tft_init();
-    setCpuFrequencyMhz(160); // 发热
+    setCpuFrequencyMhz(240);
     
     tft->initDMA();
     tft->setSwapBytes(true);
@@ -328,11 +328,11 @@ void printDebugInfo() {
     static uint32_t lastPrint = 0;
     uint32_t now = millis();
     
-    if (now - lastPrint > 1000) {
+    if (now - lastPrint > 5000) {
         lastPrint = now;
         
         Serial.printf("内存: %u, ", ESP.getFreeHeap());
-        Serial.printf("UDP包/秒: %u, ", udpPackets);
+        Serial.printf("UDP包/5秒: %u, ", udpPackets);
         Serial.printf("丢包数: %u, ", dropCount);
         Serial.printf("显示帧数: %u, ", frameCount);
         
