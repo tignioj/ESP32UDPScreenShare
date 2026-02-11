@@ -43,16 +43,26 @@ volatile uint8_t dmaSel = 0;
 volatile uint32_t frameCount = 0;
 volatile uint32_t dropCount = 0;
 volatile uint32_t udpPackets = 0;
+DRAM_ATTR bool power_save_mode = false;
+unsigned long last_receive_time = millis();
 
 // ================= UDP Receiver Function =================
 IRAM_ATTR  bool processUDPPacket() {
+
     static uint8_t rxBuf[1460];
-    
     int packetSize = udp.parsePacket();
     if (packetSize <= 0) {
+        if(millis() - last_receive_time > 5000)  // 超过5秒没收到数据，进入省电模式
+        {  
+            power_save_mode = true;
+            delay(10);
+
+        }
         return false;
     }
     udpPackets++;
+    last_receive_time = millis();
+    power_save_mode = false;
 
     // ------------------ 读 Header ------------------
     uint8_t header[5];
@@ -73,6 +83,7 @@ IRAM_ATTR  bool processUDPPacket() {
         udp.flush();
         return true;
     }
+    power_save_mode = false;
 
     bool is_rgb565 = (color_mode == 0);
 
@@ -209,12 +220,21 @@ IRAM_ATTR  bool processUDPPacket() {
     
     return true;
 }
-
 // ================= Draw Task =================
-IRAM_ATTR void drawTask(void* param) {
+ void drawTask(void* param) {
+    bool last_power_mode = power_save_mode;
     while (1) {
+        if(power_save_mode){
+            if(last_power_mode != power_save_mode) {
+                Serial.println("设置一次黑屏,进入省电模式");
+                tft->fillScreen(TFT_BLACK);
+                last_power_mode = power_save_mode;
+            }
+            vTaskDelay(100);
+            continue;
+        }
         FrameData* f = nullptr;
-
+        last_power_mode = power_save_mode;
         // 找 READY 的缓冲区
         for (int i = 0; i < FRAME_BUF_COUNT; i++) {
             if (frameBuf[i].state == BUF_READY) {
@@ -222,7 +242,7 @@ IRAM_ATTR void drawTask(void* param) {
                 break;
             }
         }
-        
+
         if (!f) {
             vTaskDelay(1); // 没有数据时短暂延时
             continue;
@@ -257,6 +277,7 @@ IRAM_ATTR void drawTask(void* param) {
         
         // 如果需要，可以在这里添加小的延时来控制绘制频率
         // vTaskDelay(1);
+
     }
 }
 
@@ -360,7 +381,6 @@ void loop() {
     while (packetProcessed) {
         packetProcessed = processUDPPacket();
     }
-    
     // 显示调试信息
     // printDebugInfo();
     
